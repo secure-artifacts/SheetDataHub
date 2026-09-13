@@ -14,7 +14,7 @@ import openpyxl
 from .config_store import ConfigStore
 from .database import AggregateDatabase
 from .models import Record, SourceConfig
-from .source_reader import SourceReader, google_retry, spreadsheet_id
+from .source_reader import SourceReader, google_retry, schema_field_names, spreadsheet_id
 
 
 ProgressFn = Callable[[str], None]
@@ -57,9 +57,9 @@ class DataEngine:
         if not use_schema:
             return []
         if source is not None and source.column_schema_enabled and source.column_schema:
-            return [str(name).strip() for name in source.column_schema]
+            return list(source.column_schema)
         if self.store.get("column_schema_enabled", False):
-            return [str(name).strip() for name in self.store.get("column_schema", [])]
+            return list(self.store.get("column_schema", []) or [])
         return []
 
     def _reader(
@@ -129,8 +129,8 @@ class DataEngine:
             include_sheets=[sheet],
             credential_path=str(self.store.get("credential_path", "")).strip(),
         )
-        extract_schema = [str(name).strip() for name in self.store.get("extract_column_schema", [])]
-        use_extract_schema = bool(self.store.get("extract_column_schema_enabled", False) and extract_schema)
+        extract_schema = list(self.store.get("extract_column_schema", []) or [])
+        use_extract_schema = bool(self.store.get("extract_column_schema_enabled", False) and schema_field_names(extract_schema))
         records = self._reader(
             operation,
             use_schema=use_extract_schema,
@@ -221,9 +221,9 @@ class DataEngine:
         fallback = list(self.store.get("field_aliases", {}).keys())
         mode = self.query_source_mode(mode, False)
         if mode == "extract":
-            schema = [str(name).strip() for name in self.store.get("extract_column_schema", []) if str(name).strip()]
-            if self.store.get("extract_column_schema_enabled", False) and schema:
-                return self._unique_headers([*schema, *fallback])
+            schema_names = schema_field_names(self.store.get("extract_column_schema", []))
+            if self.store.get("extract_column_schema_enabled", False) and schema_names:
+                return self._unique_headers([*schema_names, *fallback])
             peeked = self._peek_headers(extract_target, extract_sheet)
             if peeked:
                 return self._unique_headers(peeked)
@@ -235,19 +235,19 @@ class DataEngine:
             headers: list[str] = []
             for source in sources:
                 if source.column_schema_enabled and source.column_schema:
-                    headers.extend(str(name).strip() for name in source.column_schema)
+                    headers.extend(schema_field_names(source.column_schema))
                     continue
                 peeked = self._peek_headers(source.url, (source.include_sheets or [""])[0])
                 if peeked:
                     headers.extend(peeked)
                 elif self.store.get("column_schema_enabled", False):
-                    headers.extend(str(name).strip() for name in self.store.get("column_schema", []))
+                    headers.extend(schema_field_names(self.store.get("column_schema", [])))
             return self._unique_headers(headers) or self._unique_headers(fallback)
         headers = []
         for record in self.database.sample_records(20):
             headers.extend(record.values.keys())
         if self.store.get("column_schema_enabled", False):
-            headers.extend(str(name).strip() for name in self.store.get("column_schema", []))
+            headers.extend(schema_field_names(self.store.get("column_schema", [])))
         return self._unique_headers(headers) or self._unique_headers(fallback)
 
     def query(

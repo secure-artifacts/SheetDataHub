@@ -58,6 +58,45 @@ def parse_schema_lines(text: str | Iterable[str]) -> list[str]:
     return lines
 
 
+def excel_column(index: int) -> str:
+    result = ""
+    number = max(0, int(index)) + 1
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result or "A"
+
+
+def column_index(letter: str) -> int:
+    text = re.sub(r"[^A-Za-z]", "", str(letter or "")).upper()
+    if not text:
+        return 0
+    value = 0
+    for char in text:
+        value = value * 26 + (ord(char) - 64)
+    return max(0, value - 1)
+
+
+def normalize_column_schema(schema: Iterable[object] | None) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for index, item in enumerate(schema or []):
+        if isinstance(item, str):
+            name = item.strip()
+            result.append({"name": name, "column": excel_column(index), "enabled": bool(name)})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("header") or "").strip()
+        column = str(item.get("column") or excel_column(index)).strip().upper() or excel_column(index)
+        enabled = bool(item.get("enabled", True))
+        result.append({"name": name, "column": column, "enabled": enabled})
+    return result
+
+
+def schema_field_names(schema: Iterable[object] | None) -> list[str]:
+    return [str(item["name"]).strip() for item in normalize_column_schema(schema) if item.get("enabled") and str(item.get("name") or "").strip()]
+
+
 def choose_sheets(all_names: list[str], include: list[str], exclude: list[str]) -> tuple[list[str], list[str]]:
     available_names = {name.casefold() for name in all_names}
 
@@ -127,15 +166,39 @@ class SourceReader:
         self.aliases = aliases
         self.global_excludes = global_excludes
         self.logger = logger or (lambda level, message: None)
-        self.column_schema = [str(name).strip() for name in (column_schema or [])]
+        self.column_schema = list(column_schema or [])
 
-    def _headers(self, actual_values: list[object]) -> tuple[list[str], int | None]:
-        if not self.column_schema:
+    def _headers(self, actual_values: list[object]) -> tuple[list[str], list[int] | None]:
+        entries = normalize_column_schema(self.column_schema)
+        if not entries:
             return normalize_headers(actual_values), None
-        count = len(self.column_schema)
-        padded = list(actual_values[:count]) + [""] * max(0, count - len(actual_values))
-        configured = [self.column_schema[index] or padded[index] for index in range(count)]
-        return normalize_headers(configured), count
+        names: list[str] = []
+        indices: list[int] = []
+        padded = list(actual_values)
+        for entry in entries:
+            if not entry.get("enabled", True):
+                continue
+            index = column_index(str(entry.get("column") or "A"))
+            original = str(padded[index]).strip() if 0 <= index < len(padded) else ""
+            name = str(entry.get("name") or "").strip() or original
+            if not name:
+                continue
+            names.append(name)
+            indices.append(index)
+        if not names:
+            return normalize_headers(actual_values), None
+        return normalize_headers(names), indices
+
+    @staticmethod
+    def _cells(values: list[object], headers: list[str], selectors: list[int] | None) -> dict[str, object]:
+        cells = list(values)
+        if selectors is None:
+            limited = cells[:len(headers)] if headers else cells
+            return dict(zip(headers, limited))
+        mapped: dict[str, object] = {}
+        for name, index in zip(headers, selectors):
+            mapped[name] = cells[index] if 0 <= index < len(cells) else ""
+        return mapped
 
     def read(self, source: SourceConfig) -> list[Record]:
         sid = spreadsheet_id(source.url)
@@ -197,13 +260,12 @@ class SourceReader:
             if not header_values:
                 self.logger("WARNING", f"{source.name}/{sheet_name}：空 Sheet，已跳过")
                 continue
-            headers, column_count = self._headers(list(header_values))
+            headers, selectors = self._headers(list(header_values))
             count = 0
             for row_number, values in enumerate(rows, start=source.header_row + 1):
                 if not values or not any(value not in (None, "") for value in values):
                     continue
-                row_values = values[:column_count] if column_count else values
-                raw = dict(zip(headers, row_values))
+                raw = self._cells(list(values), headers, selectors)
                 mapped = canonicalize(raw, self.aliases)
                 digest = self._hash(sid, sheet_name, row_number, mapped)
                 records.append(Record(source.id, source.name, sid, sheet_name, row_number, mapped, digest))
@@ -247,13 +309,12 @@ class SourceReader:
             if len(values) < source.header_row:
                 self.logger("WARNING", f"{source.name}/{sheet_name}：空 Sheet，已跳过")
                 continue
-            headers, column_count = self._headers(values[source.header_row - 1])
+            headers, selectors = self._headers(values[source.header_row - 1])
             count = 0
             for row_number, row_values in enumerate(values[source.header_row:], start=source.header_row + 1):
                 if not any(str(value).strip() for value in row_values):
                     continue
-                limited_values = row_values[:column_count] if column_count else row_values
-                raw = dict(zip(headers, limited_values))
+                raw = self._cells(list(row_values), headers, selectors)
                 mapped = canonicalize(raw, self.aliases)
                 digest = self._hash(sid, sheet_name, row_number, mapped)
                 records.append(Record(source.id, source.name, sid, sheet_name, row_number, mapped, digest))

@@ -27,12 +27,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -40,12 +42,152 @@ from PySide6.QtWidgets import (
 from .config_store import ConfigStore
 from .engine import DataEngine
 from .models import Record, SourceConfig
-from .source_reader import SourceReader, parse_schema_lines, split_names
+from .source_reader import (
+    SourceReader,
+    excel_column,
+    normalize_column_schema,
+    schema_field_names,
+    split_names,
+)
 from .version import APP_VERSION, RELEASES_URL, fetch_latest_release, is_newer
 
 
 APP_TITLE = "表数通"
 QUERY_SOURCES = ["extract", "aggregate", "direct"]
+COLUMN_LETTERS = [excel_column(index) for index in range(52)]
+
+
+class ColumnMapRow(QFrame):
+    changed = Signal()
+    move_requested = Signal(object, int)
+    remove_requested = Signal(object)
+
+    def __init__(self, name: str = "", column: str = "A", enabled: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("columnMapRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+        self.enabled_box = QCheckBox()
+        self.enabled_box.setChecked(enabled)
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("表头名称，例如：贴文ID")
+        self.column_box = QComboBox()
+        self.column_box.setEditable(True)
+        self.column_box.setInsertPolicy(QComboBox.NoInsert)
+        self.column_box.addItems(COLUMN_LETTERS)
+        self.column_box.setCurrentText((column or "A").upper())
+        self.column_box.setFixedWidth(72)
+        self.column_box.setObjectName("columnLetter")
+        up = QToolButton()
+        up.setText("↑")
+        down = QToolButton()
+        down.setText("↓")
+        delete = QToolButton()
+        delete.setText("×")
+        delete.setToolTip("删除这一行")
+        layout.addWidget(self.enabled_box)
+        layout.addWidget(self.name_edit, 1)
+        layout.addWidget(self.column_box)
+        layout.addWidget(up)
+        layout.addWidget(down)
+        layout.addWidget(delete)
+        self.enabled_box.toggled.connect(self.changed)
+        self.name_edit.textChanged.connect(self.changed)
+        self.column_box.currentTextChanged.connect(self.changed)
+        up.clicked.connect(lambda: self.move_requested.emit(self, -1))
+        down.clicked.connect(lambda: self.move_requested.emit(self, 1))
+        delete.clicked.connect(lambda: self.remove_requested.emit(self))
+
+    def value(self) -> dict[str, object]:
+        return {
+            "name": self.name_edit.text().strip(),
+            "column": self.column_box.currentText().strip().upper() or "A",
+            "enabled": self.enabled_box.isChecked(),
+        }
+
+
+class ColumnMapWidget(QWidget):
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        header = QHBoxLayout()
+        enabled_label = QLabel("选用")
+        enabled_label.setFixedWidth(36)
+        name_label = QLabel("表头名称")
+        column_label = QLabel("对应列")
+        column_label.setFixedWidth(72)
+        header.addWidget(enabled_label)
+        header.addWidget(name_label, 1)
+        header.addWidget(column_label)
+        header.addSpacing(92)
+        outer.addLayout(header)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setMinimumHeight(180)
+        self.scroll.setMaximumHeight(280)
+        self.list_host = QWidget()
+        self.rows_layout = QVBoxLayout(self.list_host)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(6)
+        self.rows_layout.addStretch()
+        self.scroll.setWidget(self.list_host)
+        outer.addWidget(self.scroll)
+        actions = QHBoxLayout()
+        add = QPushButton("添加字段")
+        add.clicked.connect(lambda: self.add_row())
+        actions.addWidget(add)
+        actions.addStretch()
+        outer.addLayout(actions)
+        self._rows: list[ColumnMapRow] = []
+
+    def add_row(self, name: str = "", column: str = "", enabled: bool = True) -> None:
+        letter = column or excel_column(len(self._rows))
+        row = ColumnMapRow(name, letter, enabled, self.list_host)
+        row.changed.connect(self.changed)
+        row.move_requested.connect(self.move_row)
+        row.remove_requested.connect(self.remove_row)
+        self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+        self._rows.append(row)
+        self.changed.emit()
+
+    def move_row(self, row: ColumnMapRow, step: int) -> None:
+        index = self._rows.index(row)
+        target = index + step
+        if target < 0 or target >= len(self._rows):
+            return
+        self._rows[index], self._rows[target] = self._rows[target], self._rows[index]
+        self.rows_layout.removeWidget(row)
+        self.rows_layout.insertWidget(target, row)
+        self.changed.emit()
+
+    def remove_row(self, row: ColumnMapRow) -> None:
+        if row in self._rows:
+            self._rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.deleteLater()
+        self.changed.emit()
+
+    def set_schema(self, schema: list[object] | None) -> None:
+        for row in list(self._rows):
+            self.remove_row(row)
+        entries = normalize_column_schema(schema)
+        if not entries:
+            self.add_row("", "A", True)
+            return
+        for entry in entries:
+            self.add_row(str(entry.get("name") or ""), str(entry.get("column") or "A"), bool(entry.get("enabled", True)))
+
+    def schema(self) -> list[dict[str, object]]:
+        return [row.value() for row in self._rows]
+
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        self.scroll.setEnabled(enabled)
 
 
 class TaskThread(QThread):
@@ -69,7 +211,8 @@ class SourceDialog(QDialog):
         self.store = store
         self.source = source
         self.setWindowTitle("编辑数据源" if source else "添加数据源")
-        self.setMinimumWidth(650)
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(640)
         form = QFormLayout(self)
         self.name = QLineEdit(source.name if source else "")
         self.url = QLineEdit(source.url if source else "")
@@ -98,19 +241,18 @@ class SourceDialog(QDialog):
         form.addRow("表头所在行", self.header_row)
         form.addRow("服务账号 JSON", credential_row)
         form.addRow("", self.enabled)
-        self.use_own_schema = QCheckBox("使用独立列结构（此表列数可与其他表不同）")
+        self.use_own_schema = QCheckBox("使用独立列结构（此表可指定自己的表头和对应列）")
         self.use_own_schema.setChecked(bool(source.column_schema_enabled) if source else False)
-        self.schema_names = QTextEdit("\n".join(source.column_schema) if source and source.column_schema else "")
-        self.schema_names.setMaximumHeight(120)
-        self.schema_names.setPlaceholderText("每行一个列名，对应 A、B、C…\n例如：\n专页ID\n姓名\n手机号码\n日期")
+        self.schema_editor = ColumnMapWidget()
+        self.schema_editor.set_schema(source.column_schema if source else [])
         form.addRow("", self.use_own_schema)
-        form.addRow("独立列名", self.schema_names)
-        hint = QLabel("私有 Google 表格需要服务账号；留空时按公开表格读取。独立列结构只作用于当前数据源。")
+        form.addRow("字段分配", self.schema_editor)
+        hint = QLabel("勾选要用的字段，填写表头名称，再选择对应的表格列（A、B、C…）。可用上下箭头调整顺序。独立列结构只作用于当前数据源。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form.addRow("", hint)
-        self.use_own_schema.toggled.connect(self.schema_names.setEnabled)
-        self.schema_names.setEnabled(self.use_own_schema.isChecked())
+        self.use_own_schema.toggled.connect(self.schema_editor.setEnabled)
+        self.schema_editor.setEnabled(self.use_own_schema.isChecked())
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
@@ -125,8 +267,8 @@ class SourceDialog(QDialog):
         if not self.name.text().strip() or not self.url.text().strip():
             QMessageBox.warning(self, "缺少信息", "请填写数据源名称和表格链接。")
             return
-        if self.use_own_schema.isChecked() and not parse_schema_lines(self.schema_names.toPlainText()):
-            QMessageBox.warning(self, "缺少列结构", "启用独立列结构时，请至少填写一列名称。")
+        if self.use_own_schema.isChecked() and not schema_field_names(self.schema_editor.schema()):
+            QMessageBox.warning(self, "缺少列结构", "启用独立列结构时，请至少勾选并填写一个表头名称。")
             return
         self.accept()
 
@@ -141,7 +283,7 @@ class SourceDialog(QDialog):
             enabled=self.enabled.isChecked(),
             credential_path=self.credential.text().strip(),
             column_schema_enabled=self.use_own_schema.isChecked(),
-            column_schema=parse_schema_lines(self.schema_names.toPlainText()),
+            column_schema=self.schema_editor.schema(),
         )
 
 
@@ -389,15 +531,14 @@ class MainWindow(QMainWindow):
         form.addRow("目标表格链接", self.google_output_url)
         form.addRow("目标工作表", self.output_sheet_name)
         form.addRow("输出文件", output_row)
-        self.extract_schema_enabled = QCheckBox("提取表使用独立列结构（列数可与数据源不同）")
+        self.extract_schema_enabled = QCheckBox("提取表使用独立字段分配（表头和列可以与数据源不同）")
         self.extract_schema_enabled.setChecked(bool(self.store.get("extract_column_schema_enabled", False)))
-        self.extract_schema_names = QTextEdit("\n".join(self.store.get("extract_column_schema", []) or []))
-        self.extract_schema_names.setMaximumHeight(90)
-        self.extract_schema_names.setPlaceholderText("每行一个列名，对应提取表的 A、B、C…")
-        self.extract_schema_names.setEnabled(self.extract_schema_enabled.isChecked())
-        self.extract_schema_enabled.toggled.connect(self.extract_schema_names.setEnabled)
+        self.extract_schema_editor = ColumnMapWidget()
+        self.extract_schema_editor.set_schema(self.store.get("extract_column_schema", []) or [])
+        self.extract_schema_editor.setEnabled(self.extract_schema_enabled.isChecked())
+        self.extract_schema_enabled.toggled.connect(self.extract_schema_editor.setEnabled)
         form.addRow("", self.extract_schema_enabled)
-        form.addRow("提取表列名", self.extract_schema_names)
+        form.addRow("提取表字段", self.extract_schema_editor)
         self.output_type.currentIndexChanged.connect(self.update_output_destination)
         self.extract_mode.currentIndexChanged.connect(self.persist_workspace_settings)
         self.dedup_fields.editingFinished.connect(self.persist_workspace_settings)
@@ -419,35 +560,24 @@ class MainWindow(QMainWindow):
         return page
 
     def _fields_page(self) -> QWidget:
-        page, layout = self._page("列与字段配置", "这里是全局默认列结构。某个数据源列数不同时，请到该数据源里启用独立列结构。")
+        page, layout = self._page("列与字段配置", "给每个字段勾选、起名、指定对应列。某个数据源列不一样时，到该数据源里单独分配。")
         schema_card = QFrame()
         schema_card.setObjectName("card")
         schema_layout = QVBoxLayout(schema_card)
         schema_actions = QHBoxLayout()
-        self.schema_enabled = QCheckBox("启用手动列结构")
+        self.schema_enabled = QCheckBox("启用全局字段分配")
         self.schema_enabled.setChecked(bool(self.store.get("column_schema_enabled", False)))
-        schema = self.store.get("column_schema", [])
-        self.schema_count = QSpinBox()
-        self.schema_count.setRange(1, 200)
-        self.schema_count.setValue(len(schema) or 8)
-        example = QPushButton("填入示例 8 列")
+        example = QPushButton("填入示例")
         example.clicked.connect(self.fill_example_schema)
         schema_actions.addWidget(self.schema_enabled)
-        schema_actions.addSpacing(18)
-        schema_actions.addWidget(QLabel("读取列数"))
-        schema_actions.addWidget(self.schema_count)
         schema_actions.addWidget(example)
         schema_actions.addStretch()
-        self.schema_table = QTableWidget(0, 2)
-        self.schema_table.setHorizontalHeaderLabels(["列", "指定表头名称"])
-        self.schema_table.setMaximumHeight(245)
-        self.schema_table.verticalHeader().setVisible(False)
-        self.schema_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.schema_editor = ColumnMapWidget()
         schema_layout.addLayout(schema_actions)
-        schema_layout.addWidget(self.schema_table)
-        schema_hint = QLabel("启用后作为未单独配置的数据源默认列结构。已勾选独立列结构的数据源不会用这里的列数。")
+        schema_layout.addWidget(self.schema_editor)
+        schema_hint = QLabel("勾选字段、填写表头名称、选择对应列（A/B/C…），可用上下箭头调整顺序。已单独配置的数据源不会使用这里的分配。")
         schema_hint.setObjectName("muted")
+        schema_hint.setWordWrap(True)
         schema_layout.addWidget(schema_hint)
         layout.addWidget(schema_card)
         layout.addWidget(QLabel("标准字段与表头别名"))
@@ -468,7 +598,6 @@ class MainWindow(QMainWindow):
         actions.addWidget(save)
         layout.addWidget(self.fields_table, 1)
         layout.addLayout(actions)
-        self.schema_count.valueChanged.connect(self.resize_schema_table)
         self.schema_enabled.toggled.connect(self.update_schema_enabled)
         self.load_fields_table()
         return page
@@ -535,7 +664,7 @@ class MainWindow(QMainWindow):
         self.source_table.setRowCount(len(sources))
         for row, source in enumerate(sources):
             if source.column_schema_enabled and source.column_schema:
-                schema_label = f"独立{len(source.column_schema)}列"
+                schema_label = f"独立{len(schema_field_names(source.column_schema))}列"
             else:
                 schema_label = "自动/全局"
             values = [
@@ -631,7 +760,7 @@ class MainWindow(QMainWindow):
                 self.store.set("extract_date_field", date_field)
             if hasattr(self, "extract_schema_enabled"):
                 self.store.set("extract_column_schema_enabled", self.extract_schema_enabled.isChecked())
-                self.store.set("extract_column_schema", parse_schema_lines(self.extract_schema_names.toPlainText()))
+                self.store.set("extract_column_schema", self.extract_schema_editor.schema())
 
     def closeEvent(self, event) -> None:
         self.persist_workspace_settings()
@@ -868,10 +997,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "提取完成", message)
 
     def load_fields_table(self) -> None:
-        schema = self.store.get("column_schema", [])
-        self.resize_schema_table(self.schema_count.value())
-        for row, name in enumerate(schema[:self.schema_table.rowCount()]):
-            self.schema_table.setItem(row, 1, QTableWidgetItem(str(name)))
+        self.schema_editor.set_schema(self.store.get("column_schema", []))
         self.update_schema_enabled(self.schema_enabled.isChecked())
         aliases = self.store.get("field_aliases", {})
         self.fields_table.setRowCount(len(aliases))
@@ -882,39 +1008,16 @@ class MainWindow(QMainWindow):
     def add_field_row(self) -> None:
         self.fields_table.insertRow(self.fields_table.rowCount())
 
-    @staticmethod
-    def excel_column(index: int) -> str:
-        result = ""
-        number = index + 1
-        while number:
-            number, remainder = divmod(number - 1, 26)
-            result = chr(65 + remainder) + result
-        return result
-
-    def resize_schema_table(self, count: int) -> None:
-        existing = []
-        if hasattr(self, "schema_table"):
-            for row in range(self.schema_table.rowCount()):
-                item = self.schema_table.item(row, 1)
-                existing.append(item.text() if item else "")
-        self.schema_table.setRowCount(count)
-        for row in range(count):
-            column_item = QTableWidgetItem(self.excel_column(row))
-            column_item.setFlags(column_item.flags() & ~Qt.ItemIsEditable)
-            self.schema_table.setItem(row, 0, column_item)
-            if row < len(existing) and self.schema_table.item(row, 1) is None:
-                self.schema_table.setItem(row, 1, QTableWidgetItem(existing[row]))
-
     def update_schema_enabled(self, enabled: bool) -> None:
-        self.schema_count.setEnabled(enabled)
-        self.schema_table.setEnabled(enabled)
+        self.schema_editor.setEnabled(enabled)
 
     def fill_example_schema(self) -> None:
         names = ["专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期"]
         self.schema_enabled.setChecked(True)
-        self.schema_count.setValue(len(names))
-        for row, name in enumerate(names):
-            self.schema_table.setItem(row, 1, QTableWidgetItem(name))
+        self.schema_editor.set_schema([
+            {"name": name, "column": excel_column(index), "enabled": True}
+            for index, name in enumerate(names)
+        ])
 
     def remove_field_row(self) -> None:
         if self.fields_table.currentRow() >= 0:
@@ -931,15 +1034,12 @@ class MainWindow(QMainWindow):
         if not aliases:
             QMessageBox.warning(self, "不能保存", "至少保留一个标准字段。")
             return
-        schema = []
-        for row in range(self.schema_table.rowCount()):
-            item = self.schema_table.item(row, 1)
-            schema.append(item.text().strip() if item else "")
+        schema = self.schema_editor.schema()
         self.store.set("field_aliases", aliases)
         self.store.set("column_schema_enabled", self.schema_enabled.isChecked())
         self.store.set("column_schema", schema)
         self.refresh_field_controls()
-        QMessageBox.information(self, "已保存", f"列结构和字段配置已经保存，共 {len(schema)} 列。")
+        QMessageBox.information(self, "已保存", f"字段分配已经保存，共 {len(schema_field_names(schema))} 个启用字段。")
 
     def refresh_field_controls(self) -> None:
         aliases = self.store.get("field_aliases", {})
@@ -1108,6 +1208,8 @@ QMainWindow, QWidget { background: #f7f9fc; color: #172033; font-family: "Micros
 #pageTitle { font-size: 24px; font-weight: 700; color: #10213a; }
 #muted { color: #64748b; }
 #card { background: white; border: 1px solid #dce5ef; border-radius: 10px; padding: 16px; }
+#columnMapRow { background: white; border: 1px solid #e2eaf2; border-radius: 8px; }
+#columnLetter { font-weight: 600; }
 #infoBox { background: #e8f5ff; color: #075985; border: 1px solid #b9e4ff; border-radius: 7px; padding: 11px; }
 QPushButton { background: white; border: 1px solid #cbd5e1; border-radius: 7px; padding: 8px 14px; }
 QPushButton:hover { border-color: #0ea5e9; color: #0369a1; }

@@ -292,6 +292,30 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(records[0].values["号码"], "13800138000")
             self.assertNotIn("不读取的列", records[0].values)
 
+    def test_column_letter_mapping_skips_leading_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "letters.xlsx"
+            book = openpyxl.Workbook()
+            sheet = book.active
+            sheet.title = "数据"
+            sheet.append(["A列", "B列", "C列", "贴文ID", "手机号码", "多余"])
+            sheet.append(["x", "y", "z", "page-9", "13800138000", "no"])
+            book.save(path)
+            reader = SourceReader(
+                {"号码": ["手机号码"]},
+                [],
+                column_schema=[
+                    {"name": "贴文ID", "column": "D", "enabled": True},
+                    {"name": "手机号码", "column": "E", "enabled": True},
+                    {"name": "忽略", "column": "F", "enabled": False},
+                ],
+            )
+            records = reader.read(SourceConfig("id", "列映射", str(path)))
+            self.assertEqual(records[0].values["贴文ID"], "page-9")
+            self.assertEqual(records[0].values["号码"], "13800138000")
+            self.assertNotIn("忽略", records[0].values)
+            self.assertNotIn("A列", records[0].values)
+
     def test_private_source_uses_one_batch_request(self):
         class FakeSpreadsheet:
             def __init__(self):
