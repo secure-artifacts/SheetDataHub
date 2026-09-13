@@ -209,6 +209,14 @@ class DataEngine:
             values.extend((record.sheet_name, self.corrected_source(record.sheet_name)))
         return self._unique_headers(values)
 
+    def query_display_value(self, record: Record, field: str) -> str:
+        folded = str(field).strip().casefold()
+        if folded == "修正格式":
+            return self.corrected_source(record.sheet_name)
+        if self._canonical_field(field).casefold() == "来源":
+            return record.sheet_name
+        return self._field_value(record, field)
+
     def _peek_headers(self, target: str, sheet_name: str = "") -> list[str]:
         path = Path(str(target or "").strip())
         if not path.exists() or path.suffix.lower() not in {".xlsx", ".xlsm"}:
@@ -273,9 +281,13 @@ class DataEngine:
         extract_target: str = "",
         extract_sheet: str = "",
         source_id: str = "",
+        date_field: str = "",
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> list[Record]:
         results = self.query_many(
             field, [value], direct, exact, source, extract_target, extract_sheet, source_id,
+            date_field, start_date, end_date,
         )
         return [record for _, record in results if record is not None]
 
@@ -289,6 +301,9 @@ class DataEngine:
         extract_target: str = "",
         extract_sheet: str = "",
         source_id: str = "",
+        date_field: str = "",
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> list[tuple[str, Record | None]]:
         mode = self.query_source_mode(source, direct)
         operation = {"direct": "批量直接查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
@@ -302,6 +317,23 @@ class DataEngine:
             records = self.read_sources(operation, source_id)
         else:
             records = self.database.all_records()
+        if date_field.strip():
+            if start_date is None or end_date is None:
+                raise ValueError("日期范围不完整")
+            if start_date > end_date:
+                raise ValueError("开始日期不能晚于结束日期")
+            before = len(records)
+            filtered: list[Record] = []
+            for record in records:
+                current = parse_date(self._field_value(record, date_field))
+                if current is not None and start_date <= current <= end_date:
+                    filtered.append(record)
+            records = filtered
+            self._log(
+                operation,
+                "INFO",
+                f"日期限制：字段“{date_field}”，{start_date.isoformat()} 至 {end_date.isoformat()}，保留 {len(records)}/{before} 行",
+            )
         canonical = self._canonical_field(field)
         results: list[tuple[str, Record | None]] = []
         matched_inputs = 0

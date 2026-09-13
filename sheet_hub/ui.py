@@ -442,7 +442,7 @@ class MainWindow(QMainWindow):
         self.query_field.setMinimumWidth(140)
         self.query_value = QTextEdit()
         self.query_value.setMaximumHeight(78)
-        self.query_value.setPlaceholderText("每行一个号码，也支持逗号分隔批量粘贴")
+        self.query_value.setPlaceholderText("每行一个查询值，也支持逗号分隔批量粘贴")
         self.query_mode = QComboBox()
         self.query_mode.addItems(["查询提取表", "查询汇总数据库", "直接查询数据源"])
         saved_source = str(self.store.get("query_source", "extract"))
@@ -454,9 +454,30 @@ class MainWindow(QMainWindow):
         self.query_fuzzy = QCheckBox("模糊匹配")
         self.query_fuzzy.setChecked(bool(self.store.get("query_fuzzy", False)))
         self.query_fuzzy.setToolTip("勾选后可用姓名、编号或部分文字查询；查询来源时也会匹配修正格式")
+        self.query_date_enabled = QCheckBox("限制日期范围")
+        self.query_date_enabled.setChecked(bool(self.store.get("query_date_enabled", False)))
+        self.query_date_field = QComboBox()
+        self.query_date_field.setEditable(True)
+        self.query_date_field.setMinimumWidth(120)
+        self.query_start_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.query_end_date = QDateEdit(QDate.currentDate())
+        for widget, key in (
+            (self.query_start_date, "query_start_date"),
+            (self.query_end_date, "query_end_date"),
+        ):
+            widget.setCalendarPopup(True)
+            widget.setDisplayFormat("yyyy-MM-dd")
+            saved = QDate.fromString(str(self.store.get(key, "") or ""), "yyyy-MM-dd")
+            if saved.isValid():
+                widget.setDate(saved)
         self.query_mode.currentIndexChanged.connect(self.on_query_mode_changed)
         self.query_source_pick.currentIndexChanged.connect(self.on_query_table_changed)
         self.query_fuzzy.toggled.connect(self.persist_workspace_settings)
+        self.query_date_enabled.toggled.connect(self.update_query_date_controls)
+        self.query_date_enabled.toggled.connect(self.persist_workspace_settings)
+        self.query_date_field.currentTextChanged.connect(self.persist_workspace_settings)
+        self.query_start_date.dateChanged.connect(self.persist_workspace_settings)
+        self.query_end_date.dateChanged.connect(self.persist_workspace_settings)
         self.query_field.currentTextChanged.connect(self.persist_workspace_settings)
         button = QPushButton("查询")
         button.setObjectName("primary")
@@ -474,6 +495,15 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.query_fuzzy)
         bar.addWidget(button)
         bar.addWidget(self.copy_query_button)
+        date_bar = QHBoxLayout()
+        date_bar.addWidget(self.query_date_enabled)
+        date_bar.addWidget(QLabel("日期字段"))
+        date_bar.addWidget(self.query_date_field)
+        date_bar.addWidget(QLabel("日期范围"))
+        date_bar.addWidget(self.query_start_date)
+        date_bar.addWidget(QLabel("至"))
+        date_bar.addWidget(self.query_end_date)
+        date_bar.addStretch()
         self.query_table = QTableWidget()
         self.query_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -483,8 +513,10 @@ class MainWindow(QMainWindow):
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addLayout(bar)
+        layout.addLayout(date_bar)
         layout.addWidget(hint)
         layout.addWidget(self.query_table, 1)
+        self.update_query_date_controls()
         return page
 
     def _extract_page(self) -> QWidget:
@@ -741,6 +773,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "query_mode"):
             self.store.set("query_source", QUERY_SOURCES[self.query_mode.currentIndex()])
             self.store.set("query_fuzzy", self.query_fuzzy.isChecked())
+            self.store.set("query_date_enabled", self.query_date_enabled.isChecked())
+            self.store.set("query_date_field", self.query_date_field.currentText().strip() or "日期")
+            self.store.set("query_start_date", self.query_start_date.date().toString("yyyy-MM-dd"))
+            self.store.set("query_end_date", self.query_end_date.date().toString("yyyy-MM-dd"))
             field = self.query_field.currentText().strip()
             if field:
                 self.store.set("query_field", field)
@@ -807,6 +843,11 @@ class MainWindow(QMainWindow):
         self.query_table_label.setVisible(direct)
         self.query_source_pick.setVisible(direct)
 
+    def update_query_date_controls(self) -> None:
+        enabled = self.query_date_enabled.isChecked()
+        for widget in (self.query_date_field, self.query_start_date, self.query_end_date):
+            widget.setEnabled(enabled)
+
     def refresh_query_source_picker(self) -> None:
         if not hasattr(self, "query_source_pick"):
             return
@@ -856,6 +897,15 @@ class MainWindow(QMainWindow):
             if pick not in fields:
                 self.query_field.insertItem(0, pick)
             self.query_field.setCurrentText(pick)
+        current_date_field = self.query_date_field.currentText().strip()
+        saved_date_field = str(self.store.get("query_date_field", "日期") or "日期").strip()
+        self.query_date_field.clear()
+        self.query_date_field.addItems(fields)
+        date_pick = current_date_field if current_date_field in fields else saved_date_field
+        if date_pick:
+            if date_pick not in fields:
+                self.query_date_field.insertItem(0, date_pick)
+            self.query_date_field.setCurrentText(date_pick)
         self._restoring_settings = restoring
 
     def run_query(self) -> None:
@@ -872,15 +922,22 @@ class MainWindow(QMainWindow):
         exact = not self.query_fuzzy.isChecked()
         extract_target, extract_sheet = self.extract_query_target()
         source_id = self.current_query_source_id()
+        date_field = self.query_date_field.currentText().strip() if self.query_date_enabled.isChecked() else ""
+        start_date = self.query_start_date.date().toPython() if date_field else None
+        end_date = self.query_end_date.date().toPython() if date_field else None
         if source == "extract" and not extract_target:
             QMessageBox.warning(self, "缺少提取表", "请先在「时间提取」页填写目标 Google 表格链接或本地输出文件。")
             return
         self.persist_workspace_settings()
+        result_fields = engine.list_query_fields(source, extract_target, extract_sheet, source_id)
+        if not result_fields:
+            result_fields = [field]
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
+                date_field, start_date, end_date,
             ),
-            self.show_query_results,
+            lambda results: self.show_query_results(results, result_fields, field),
             "正在批量查询…",
         )
 
@@ -896,35 +953,42 @@ class MainWindow(QMainWindow):
                 return value
         return ""
 
-    def show_query_results(self, results: list[tuple[str, Record | None]]) -> None:
-        fields = ["输入电话号码", "专页ID", "姓名", "评论贴文", "号码", "日期", "修正格式"]
+    def show_query_results(
+        self,
+        results: list[tuple[str, Record | None]],
+        fields: list[str] | None = None,
+        query_field: str = "号码",
+    ) -> None:
+        fields = fields or [query_field]
         self.query_table.setColumnCount(len(fields))
         self.query_table.setHorizontalHeaderLabels(fields)
         self.query_table.setRowCount(len(results))
         self.query_copy_rows: list[tuple[str, str]] = []
+        engine = DataEngine(self.store)
+        query_canonical = engine._canonical_field(query_field).casefold()
         found = 0
         for row, (query_value, record) in enumerate(results):
             if record is None:
-                values = [query_value, "", "", "", query_value, "", "未找到"]
+                values = ["" for _ in fields]
+                for column, header_name in enumerate(fields):
+                    if engine._canonical_field(header_name).casefold() == query_canonical:
+                        values[column] = query_value
+                        break
+                phone = query_value if query_canonical == "号码" else ""
+                corrected = "未找到"
             else:
                 found += 1
-                source = record.sheet_name
-                phone = self.record_value(record, "手机号码", "号码") or query_value
-                values = [
-                    query_value,
-                    self.record_value(record, "专页ID"),
-                    self.record_value(record, "姓名", "名字"),
-                    self.record_value(record, "评论贴文"),
-                    phone,
-                    self.record_value(record, "日期"),
-                    self.corrected_source(source),
-                ]
-            self.query_copy_rows.append((str(values[4]), str(values[6])))
+                values = [engine.query_display_value(record, header_name) for header_name in fields]
+                phone = engine._field_value(record, "号码") or (query_value if query_canonical == "号码" else "")
+                corrected = self.corrected_source(record.sheet_name)
+            self.query_copy_rows.append((str(phone), str(corrected)))
             for column, value in enumerate(values):
                 self.query_table.setItem(row, column, QTableWidgetItem(str(value)))
         header = self.query_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        for column, header_name in enumerate(fields):
+            if header_name.strip().casefold() in {"评论贴文", "链接", "网址", "url", "link"}:
+                header.setSectionResizeMode(column, QHeaderView.Stretch)
         self.copy_query_button.setEnabled(bool(self.query_copy_rows))
         missing = len(results) - found
         message = f"查询完成：输出 {len(results)} 行，匹配 {found} 行"

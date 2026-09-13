@@ -90,6 +90,7 @@ class RuleTests(unittest.TestCase):
             self.assertEqual(reopened.get("google_output_sheet"), "提取结果")
             self.assertTrue(reopened.get("query_exact"))
             self.assertFalse(reopened.get("query_fuzzy"))
+            self.assertFalse(reopened.get("query_date_enabled"))
 
 
 class DatabaseTests(unittest.TestCase):
@@ -148,6 +149,22 @@ class DatabaseTests(unittest.TestCase):
             ])
             results = engine.query_many("来源", ["赵刚-1233-专页后台"], exact=True)
             self.assertEqual(results[0][1].sheet_name, "1233-赵刚")
+
+    def test_query_can_limit_results_by_date_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "A", 2, {"名字": "刘海", "日期": "2026-09-01"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"名字": "刘海", "日期": "2026-09-13"}, "h2"),
+                Record("s", "源", "g", "C", 4, {"名字": "刘海", "日期": "无效日期"}, "h3"),
+            ])
+            results = engine.query_many(
+                "名字", ["刘海"], exact=True, date_field="日期",
+                start_date=date(2026, 9, 10), end_date=date(2026, 9, 20),
+            )
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0][1].sheet_name, "B")
 
     def test_query_extract_table_is_faster_subset(self):
         with tempfile.TemporaryDirectory() as directory:
