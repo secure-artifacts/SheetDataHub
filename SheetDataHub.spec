@@ -1,0 +1,54 @@
+# -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
+root = Path(SPECPATH)
+
+a = Analysis(
+    [str(root / 'app.py')],
+    pathex=[str(root)],
+    binaries=[],
+    datas=[(str(root / 'assets' / 'app.ico'), 'assets')],
+    hiddenimports=['gspread', 'google.auth', 'google.oauth2.service_account', 'openpyxl'],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+# Qt 6.11 uses the Windows system ICU shim. A third-party ICU on the build PATH
+# can be auto-collected and shadow the system DLL, causing WinError 127.
+a.binaries = [
+    item for item in a.binaries
+    if Path(item[0]).name.casefold() not in {'icuuc.dll', 'icudt78.dll'}
+]
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    name='SheetDataHub',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=[str(root / 'assets' / 'app.ico')],
+    exclude_binaries=True,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='SheetDataHub',
+)
