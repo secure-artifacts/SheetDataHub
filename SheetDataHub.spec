@@ -11,8 +11,8 @@ a = Analysis(
     hiddenimports=['gspread', 'google.auth', 'google.oauth2.service_account', 'openpyxl'],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
+    runtime_hooks=[str(root / 'packaging' / 'pyi_rth_skip_numpy.py')],
+    excludes=['numpy', 'pandas', 'matplotlib', 'scipy', 'tkinter'],
     noarchive=False,
     optimize=0,
 )
@@ -31,7 +31,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -48,7 +48,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='SheetDataHub',
 )

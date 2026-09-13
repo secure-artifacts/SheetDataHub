@@ -5,7 +5,7 @@ import re
 import requests
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 UPDATE_REPO = "secure-artifacts/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 

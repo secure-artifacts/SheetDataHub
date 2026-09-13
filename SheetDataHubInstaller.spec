@@ -14,8 +14,8 @@ a = Analysis(
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
+    runtime_hooks=[str(root / 'packaging' / 'pyi_rth_skip_numpy.py')],
+    excludes=['numpy', 'pandas', 'matplotlib', 'scipy', 'tkinter'],
     noarchive=False,
     optimize=0,
 )
@@ -30,7 +30,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     icon=[str(root / 'assets' / 'app.ico')],
 )
