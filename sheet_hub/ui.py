@@ -6,8 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDate, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QDate, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,10 +40,12 @@ from PySide6.QtWidgets import (
 from .config_store import ConfigStore
 from .engine import DataEngine
 from .models import Record, SourceConfig
-from .source_reader import SourceReader, split_names
+from .source_reader import SourceReader, parse_schema_lines, split_names
+from .version import APP_VERSION, RELEASES_URL, fetch_latest_release, is_newer
 
 
 APP_TITLE = "表数通"
+QUERY_SOURCES = ["extract", "aggregate", "direct"]
 
 
 class TaskThread(QThread):
@@ -96,9 +98,19 @@ class SourceDialog(QDialog):
         form.addRow("表头所在行", self.header_row)
         form.addRow("服务账号 JSON", credential_row)
         form.addRow("", self.enabled)
-        hint = QLabel("私有 Google 表格需要服务账号；留空时按公开表格读取。")
+        self.use_own_schema = QCheckBox("使用独立列结构（此表列数可与其他表不同）")
+        self.use_own_schema.setChecked(bool(source.column_schema_enabled) if source else False)
+        self.schema_names = QTextEdit("\n".join(source.column_schema) if source and source.column_schema else "")
+        self.schema_names.setMaximumHeight(120)
+        self.schema_names.setPlaceholderText("每行一个列名，对应 A、B、C…\n例如：\n专页ID\n姓名\n手机号码\n日期")
+        form.addRow("", self.use_own_schema)
+        form.addRow("独立列名", self.schema_names)
+        hint = QLabel("私有 Google 表格需要服务账号；留空时按公开表格读取。独立列结构只作用于当前数据源。")
         hint.setObjectName("muted")
+        hint.setWordWrap(True)
         form.addRow("", hint)
+        self.use_own_schema.toggled.connect(self.schema_names.setEnabled)
+        self.schema_names.setEnabled(self.use_own_schema.isChecked())
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
@@ -113,6 +125,9 @@ class SourceDialog(QDialog):
         if not self.name.text().strip() or not self.url.text().strip():
             QMessageBox.warning(self, "缺少信息", "请填写数据源名称和表格链接。")
             return
+        if self.use_own_schema.isChecked() and not parse_schema_lines(self.schema_names.toPlainText()):
+            QMessageBox.warning(self, "缺少列结构", "启用独立列结构时，请至少填写一列名称。")
+            return
         self.accept()
 
     def value(self) -> SourceConfig:
@@ -125,6 +140,8 @@ class SourceDialog(QDialog):
             header_row=self.header_row.value(),
             enabled=self.enabled.isChecked(),
             credential_path=self.credential.text().strip(),
+            column_schema_enabled=self.use_own_schema.isChecked(),
+            column_schema=parse_schema_lines(self.schema_names.toPlainText()),
         )
 
 
@@ -134,6 +151,7 @@ class MainWindow(QMainWindow):
         self.store = store
         self.tasks: list[TaskThread] = []
         self.icon_path = icon_path
+        self._restoring_settings = True
         self.setWindowTitle(f"{APP_TITLE} · 多表数据查询与提取")
         self.resize(1220, 780)
         self.setMinimumSize(980, 650)
@@ -143,6 +161,8 @@ class MainWindow(QMainWindow):
         self.refresh_sources()
         self.refresh_field_controls()
         self.refresh_logs()
+        self._restoring_settings = False
+        QTimer.singleShot(1500, self.check_updates_silent)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -173,9 +193,12 @@ class MainWindow(QMainWindow):
         sidebar_layout.addLayout(brand_row)
         sidebar_layout.addSpacing(22)
         sidebar_layout.addWidget(self.nav, 1)
-        version = QLabel("v1.1.2")
-        version.setObjectName("sidebarMuted")
-        sidebar_layout.addWidget(version)
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setObjectName("sidebarMuted")
+        self.sidebar_update_button = QPushButton("检查更新")
+        self.sidebar_update_button.clicked.connect(self.check_updates)
+        sidebar_layout.addWidget(self.version_label)
+        sidebar_layout.addWidget(self.sidebar_update_button)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._sources_page())
         self.pages.addWidget(self._sync_page())
@@ -205,7 +228,7 @@ class MainWindow(QMainWindow):
         return page, layout
 
     def _sources_page(self) -> QWidget:
-        page, layout = self._page("数据源", "配置一个或多个 Google 表格链接；每个链接可以指定或排除子 Sheet。")
+        page, layout = self._page("数据源", "配置一个或多个 Google 表格链接；每个数据源都可以有自己的列数和表头。")
         actions = QHBoxLayout()
         add = QPushButton("＋ 添加数据源")
         add.setObjectName("primary")
@@ -221,15 +244,15 @@ class MainWindow(QMainWindow):
         actions.addWidget(remove)
         actions.addWidget(scan)
         actions.addStretch()
-        self.source_table = QTableWidget(0, 7)
-        self.source_table.setHorizontalHeaderLabels(["启用", "名称", "表格链接", "指定 Sheet", "排除 Sheet", "表头行", "认证"])
+        self.source_table = QTableWidget(0, 8)
+        self.source_table.setHorizontalHeaderLabels(["启用", "名称", "表格链接", "指定 Sheet", "排除 Sheet", "表头行", "列结构", "认证"])
         self.source_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.source_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.source_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.source_table.verticalHeader().setVisible(False)
         self.source_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.source_table.doubleClicked.connect(self.edit_source)
-        rule = QLabel("读取规则：指定名称留空时遍历全部；填写后仅抓取指定项；排除项始终优先。")
+        rule = QLabel("读取规则：指定名称留空时遍历全部；填写后仅抓取指定项；排除项始终优先。不同表格列数不一样时，在编辑数据源里勾选「独立列结构」。")
         rule.setObjectName("infoBox")
         layout.addLayout(actions)
         layout.addWidget(self.source_table, 1)
@@ -266,26 +289,45 @@ class MainWindow(QMainWindow):
         return page
 
     def _query_page(self) -> QWidget:
-        page, layout = self._page("数据查询", "按任意标准字段查询；可选择汇总库查询或直接遍历数据源。")
+        page, layout = self._page(
+            "数据查询",
+            "切换表格来源时，查询字段会换成该表自己的表头；也可以手输列名自定义查询。",
+        )
         bar = QHBoxLayout()
         self.query_field = QComboBox()
+        self.query_field.setEditable(True)
+        self.query_field.setInsertPolicy(QComboBox.NoInsert)
+        self.query_field.setMinimumWidth(140)
         self.query_value = QTextEdit()
         self.query_value.setMaximumHeight(78)
         self.query_value.setPlaceholderText("每行一个号码，也支持逗号分隔批量粘贴")
         self.query_mode = QComboBox()
-        self.query_mode.addItems(["查询汇总数据库", "直接查询数据源"])
+        self.query_mode.addItems(["查询提取表", "查询汇总数据库", "直接查询数据源"])
+        saved_source = str(self.store.get("query_source", "extract"))
+        if saved_source in QUERY_SOURCES:
+            self.query_mode.setCurrentIndex(QUERY_SOURCES.index(saved_source))
+        self.query_table_label = QLabel("数据表")
+        self.query_source_pick = QComboBox()
+        self.query_source_pick.setMinimumWidth(140)
         self.query_exact = QCheckBox("精确匹配")
-        self.query_exact.setChecked(True)
+        self.query_exact.setChecked(bool(self.store.get("query_exact", True)))
+        self.query_mode.currentIndexChanged.connect(self.on_query_mode_changed)
+        self.query_source_pick.currentIndexChanged.connect(self.on_query_table_changed)
+        self.query_exact.toggled.connect(self.persist_workspace_settings)
+        self.query_field.currentTextChanged.connect(self.persist_workspace_settings)
         button = QPushButton("查询")
         button.setObjectName("primary")
         button.clicked.connect(self.run_query)
         self.copy_query_button = QPushButton("一键复制号码和修正格式")
         self.copy_query_button.setEnabled(False)
         self.copy_query_button.clicked.connect(self.copy_query_results)
+        bar.addWidget(QLabel("表格来源"))
+        bar.addWidget(self.query_mode)
+        bar.addWidget(self.query_table_label)
+        bar.addWidget(self.query_source_pick)
         bar.addWidget(QLabel("查询字段"))
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
-        bar.addWidget(self.query_mode)
         bar.addWidget(self.query_exact)
         bar.addWidget(button)
         bar.addWidget(self.copy_query_button)
@@ -294,7 +336,11 @@ class MainWindow(QMainWindow):
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.query_table.verticalHeader().setVisible(False)
         self.query_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        hint = QLabel("提取表、汇总库、每个数据源都可以用各自表头查询。查数据源时先选数据表，查询字段会跟着切换；也可以直接输入列名。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
         layout.addLayout(bar)
+        layout.addWidget(hint)
         layout.addWidget(self.query_table, 1)
         return page
 
@@ -304,6 +350,7 @@ class MainWindow(QMainWindow):
         card.setObjectName("card")
         form = QFormLayout(card)
         self.extract_date_field = QComboBox()
+        self.extract_date_field.currentTextChanged.connect(self.persist_workspace_settings)
         self.start_date = QDateEdit(QDate.currentDate().addMonths(-1))
         self.end_date = QDateEdit(QDate.currentDate())
         for widget in (self.start_date, self.end_date):
@@ -314,17 +361,21 @@ class MainWindow(QMainWindow):
         date_row.addWidget(QLabel("至"))
         date_row.addWidget(self.end_date)
         date_row.addStretch()
-        self.dedup_fields = QLineEdit("号码,日期")
+        self.dedup_fields = QLineEdit(str(self.store.get("extract_dedup_fields", "号码,日期") or "号码,日期"))
         self.dedup_fields.setPlaceholderText("多个字段用逗号分隔；留空时使用源位置和行指纹")
         self.extract_mode = QComboBox()
         self.extract_mode.addItems(["从汇总数据库提取", "直接从数据源提取"])
+        self.extract_mode.setCurrentIndex(1 if str(self.store.get("extract_mode", "aggregate")) == "direct" else 0)
         self.output_type = QComboBox()
         self.output_type.addItems(["本地 Excel 文件", "Google 表格链接"])
-        self.output_sheet_name = QLineEdit(str(self.store.get("google_output_sheet", "提取结果")))
+        saved_type = str(self.store.get("extract_destination_type", "local"))
+        self.output_type.setCurrentIndex(1 if saved_type == "google" else 0)
+        self.output_sheet_name = QLineEdit(str(self.store.get("google_output_sheet", "提取结果") or "提取结果"))
         self.output_sheet_name.setPlaceholderText("例如：查询结果")
-        self.google_output_url = QLineEdit(str(self.store.get("google_output_url", "")))
+        self.google_output_url = QLineEdit(str(self.store.get("google_output_url", "") or ""))
         self.google_output_url.setPlaceholderText("https://docs.google.com/spreadsheets/d/...")
-        self.output_path = QLineEdit(str(Path.home() / "Desktop" / "提取结果.xlsx"))
+        saved_path = str(self.store.get("extract_output_path", "") or "").strip()
+        self.output_path = QLineEdit(saved_path or str(Path.home() / "Desktop" / "提取结果.xlsx"))
         choose = QPushButton("选择…")
         choose.clicked.connect(self.choose_output)
         output_row = QHBoxLayout()
@@ -338,7 +389,22 @@ class MainWindow(QMainWindow):
         form.addRow("目标表格链接", self.google_output_url)
         form.addRow("目标工作表", self.output_sheet_name)
         form.addRow("输出文件", output_row)
+        self.extract_schema_enabled = QCheckBox("提取表使用独立列结构（列数可与数据源不同）")
+        self.extract_schema_enabled.setChecked(bool(self.store.get("extract_column_schema_enabled", False)))
+        self.extract_schema_names = QTextEdit("\n".join(self.store.get("extract_column_schema", []) or []))
+        self.extract_schema_names.setMaximumHeight(90)
+        self.extract_schema_names.setPlaceholderText("每行一个列名，对应提取表的 A、B、C…")
+        self.extract_schema_names.setEnabled(self.extract_schema_enabled.isChecked())
+        self.extract_schema_enabled.toggled.connect(self.extract_schema_names.setEnabled)
+        form.addRow("", self.extract_schema_enabled)
+        form.addRow("提取表列名", self.extract_schema_names)
         self.output_type.currentIndexChanged.connect(self.update_output_destination)
+        self.extract_mode.currentIndexChanged.connect(self.persist_workspace_settings)
+        self.dedup_fields.editingFinished.connect(self.persist_workspace_settings)
+        self.google_output_url.editingFinished.connect(self.persist_workspace_settings)
+        self.output_sheet_name.editingFinished.connect(self.persist_workspace_settings)
+        self.output_path.editingFinished.connect(self.persist_workspace_settings)
+        self.extract_schema_enabled.toggled.connect(self.persist_workspace_settings)
         self.local_output_widgets = [self.output_path, choose]
         self.update_output_destination()
         button = QPushButton("开始提取")
@@ -353,7 +419,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _fields_page(self) -> QWidget:
-        page, layout = self._page("列与字段配置", "可以明确指定读取列数和每一列的表头；不启用时自动使用数据源原始表头。")
+        page, layout = self._page("列与字段配置", "这里是全局默认列结构。某个数据源列数不同时，请到该数据源里启用独立列结构。")
         schema_card = QFrame()
         schema_card.setObjectName("card")
         schema_layout = QVBoxLayout(schema_card)
@@ -380,7 +446,7 @@ class MainWindow(QMainWindow):
         self.schema_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         schema_layout.addLayout(schema_actions)
         schema_layout.addWidget(self.schema_table)
-        schema_hint = QLabel("启用后只读取前 N 列，并按这里的名称识别 A、B、C…列；名称留空时保留原表头。")
+        schema_hint = QLabel("启用后作为未单独配置的数据源默认列结构。已勾选独立列结构的数据源不会用这里的列数。")
         schema_hint.setObjectName("muted")
         schema_layout.addWidget(schema_hint)
         layout.addWidget(schema_card)
@@ -427,7 +493,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _settings_page(self) -> QWidget:
-        page, layout = self._page("设置", "配置所有数据源共用的默认排除项和认证文件。")
+        page, layout = self._page("设置", "配置所有数据源共用的默认排除项、认证文件，以及软件更新。")
         card = QFrame()
         card.setObjectName("card")
         form = QFormLayout(card)
@@ -447,6 +513,13 @@ class MainWindow(QMainWindow):
         data_path = QLabel(str(self.store.data_dir))
         data_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
         form.addRow("本地数据目录", data_path)
+        version_row = QHBoxLayout()
+        version_row.addWidget(QLabel(f"当前版本 v{APP_VERSION}"))
+        self.update_button = QPushButton("检查更新")
+        self.update_button.clicked.connect(self.check_updates)
+        version_row.addWidget(self.update_button)
+        version_row.addStretch()
+        form.addRow("软件版本", version_row)
         layout.addWidget(card)
         layout.addWidget(save, 0, Qt.AlignLeft)
         layout.addStretch()
@@ -461,13 +534,20 @@ class MainWindow(QMainWindow):
         sources = self.store.load_sources()
         self.source_table.setRowCount(len(sources))
         for row, source in enumerate(sources):
+            if source.column_schema_enabled and source.column_schema:
+                schema_label = f"独立{len(source.column_schema)}列"
+            else:
+                schema_label = "自动/全局"
             values = [
                 "是" if source.enabled else "否", source.name, source.url,
                 "、".join(source.include_sheets) or "全部", "、".join(source.exclude_sheets) or "—",
-                str(source.header_row), "服务账号" if source.credential_path else "公开读取",
+                str(source.header_row), schema_label, "服务账号" if source.credential_path else "公开读取",
             ]
             for column, value in enumerate(values):
                 self.source_table.setItem(row, column, QTableWidgetItem(value))
+        self.refresh_query_source_picker()
+        if not getattr(self, "_restoring_settings", False):
+            self.refresh_query_fields()
 
     def add_source(self) -> None:
         dialog = SourceDialog(self.store, parent=self)
@@ -525,16 +605,154 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "读取完成", f"已读取 {result['rows']} 行；未写入汇总库。")
 
+    def persist_workspace_settings(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        if hasattr(self, "query_mode"):
+            self.store.set("query_source", QUERY_SOURCES[self.query_mode.currentIndex()])
+            self.store.set("query_exact", self.query_exact.isChecked())
+            field = self.query_field.currentText().strip()
+            if field:
+                self.store.set("query_field", field)
+                saved_map = dict(self.store.get("query_fields_by_mode", {}) or {})
+                saved_map[QUERY_SOURCES[self.query_mode.currentIndex()]] = field
+                self.store.set("query_fields_by_mode", saved_map)
+            if hasattr(self, "query_source_pick"):
+                self.store.set("query_direct_source_id", self.query_source_pick.currentData() or "")
+        if hasattr(self, "output_type"):
+            self.store.set("extract_destination_type", "google" if self.output_type.currentIndex() == 1 else "local")
+            self.store.set("google_output_url", self.google_output_url.text().strip())
+            self.store.set("google_output_sheet", self.output_sheet_name.text().strip() or "提取结果")
+            self.store.set("extract_output_path", self.output_path.text().strip())
+            self.store.set("extract_mode", "direct" if self.extract_mode.currentIndex() == 1 else "aggregate")
+            self.store.set("extract_dedup_fields", self.dedup_fields.text().strip() or "号码,日期")
+            date_field = self.extract_date_field.currentText().strip()
+            if date_field:
+                self.store.set("extract_date_field", date_field)
+            if hasattr(self, "extract_schema_enabled"):
+                self.store.set("extract_column_schema_enabled", self.extract_schema_enabled.isChecked())
+                self.store.set("extract_column_schema", parse_schema_lines(self.extract_schema_names.toPlainText()))
+
+    def closeEvent(self, event) -> None:
+        self.persist_workspace_settings()
+        super().closeEvent(event)
+
+    def extract_query_target(self) -> tuple[str, str]:
+        sheet_name = str(self.store.get("google_output_sheet", "提取结果") or "提取结果")
+        if hasattr(self, "output_sheet_name"):
+            sheet_name = self.output_sheet_name.text().strip() or sheet_name
+        if hasattr(self, "output_type"):
+            if self.output_type.currentIndex() == 1:
+                return self.google_output_url.text().strip(), sheet_name
+            return self.output_path.text().strip(), sheet_name
+        if str(self.store.get("extract_destination_type", "local")) == "google":
+            return str(self.store.get("google_output_url", "") or ""), sheet_name
+        return str(self.store.get("extract_output_path", "") or ""), sheet_name
+
+    def current_query_mode(self) -> str:
+        return QUERY_SOURCES[self.query_mode.currentIndex()]
+
+    def current_query_source_id(self) -> str:
+        if self.current_query_mode() != "direct" or not hasattr(self, "query_source_pick"):
+            return ""
+        return str(self.query_source_pick.currentData() or "")
+
+    def on_query_mode_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.update_query_source_visibility()
+        self.refresh_query_fields()
+        self.persist_workspace_settings()
+
+    def on_query_table_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.refresh_query_fields()
+        self.persist_workspace_settings()
+
+    def update_query_source_visibility(self) -> None:
+        if not hasattr(self, "query_source_pick"):
+            return
+        direct = self.current_query_mode() == "direct"
+        self.query_table_label.setVisible(direct)
+        self.query_source_pick.setVisible(direct)
+
+    def refresh_query_source_picker(self) -> None:
+        if not hasattr(self, "query_source_pick"):
+            return
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        saved = str(self.store.get("query_direct_source_id", "") or "")
+        current = self.query_source_pick.currentData()
+        self.query_source_pick.clear()
+        self.query_source_pick.addItem("全部数据源", "")
+        for source in self.store.load_sources():
+            if source.enabled:
+                self.query_source_pick.addItem(source.name, source.id)
+        target = current if current not in (None, "") else saved
+        index = self.query_source_pick.findData(target)
+        self.query_source_pick.setCurrentIndex(index if index >= 0 else 0)
+        self._restoring_settings = restoring
+        self.update_query_source_visibility()
+
+    def refresh_query_fields(self) -> None:
+        if not hasattr(self, "query_field"):
+            return
+        mode = self.current_query_mode()
+        extract_target, extract_sheet = self.extract_query_target()
+        fields = DataEngine(self.store).list_query_fields(
+            mode, extract_target, extract_sheet, self.current_query_source_id(),
+        )
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        current = self.query_field.currentText().strip()
+        saved_map = self.store.get("query_fields_by_mode", {}) or {}
+        saved = str(saved_map.get(mode) or self.store.get("query_field", "") or "").strip()
+        self.query_field.clear()
+        self.query_field.addItems(fields)
+        if saved in fields:
+            pick = saved
+        elif current in fields:
+            pick = current
+        elif "号码" in fields:
+            pick = "号码"
+        elif "手机号码" in fields:
+            pick = "手机号码"
+        elif fields:
+            pick = fields[0]
+        else:
+            pick = saved or current
+        if pick:
+            if pick not in fields:
+                self.query_field.insertItem(0, pick)
+            self.query_field.setCurrentText(pick)
+        self._restoring_settings = restoring
+
     def run_query(self) -> None:
         values = split_names(self.query_value.toPlainText())
         if not values:
             QMessageBox.warning(self, "请输入", "请输入一个或多个查询号码。")
             return
         engine = DataEngine(self.store)
-        field = self.query_field.currentText()
-        direct = self.query_mode.currentIndex() == 1
+        field = self.query_field.currentText().strip()
+        if not field:
+            QMessageBox.warning(self, "请选择", "请选择或输入要查询的字段。")
+            return
+        source = self.current_query_mode()
         exact = self.query_exact.isChecked()
-        self.run_task(lambda: engine.query_many(field, values, direct, exact), self.show_query_results, "正在批量查询…")
+        extract_target, extract_sheet = self.extract_query_target()
+        source_id = self.current_query_source_id()
+        if source == "extract" and not extract_target:
+            QMessageBox.warning(self, "缺少提取表", "请先在「时间提取」页填写目标 Google 表格链接或本地输出文件。")
+            return
+        self.persist_workspace_settings()
+        self.run_task(
+            lambda: engine.query_many(
+                field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
+            ),
+            self.show_query_results,
+            "正在批量查询…",
+        )
 
     @staticmethod
     def corrected_source(source: str) -> str:
@@ -581,7 +799,11 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         self.copy_query_button.setEnabled(bool(self.query_copy_rows))
-        self.statusBar().showMessage(f"查询完成：输出 {len(results)} 行，匹配 {found} 行", 8000)
+        missing = len(results) - found
+        message = f"查询完成：输出 {len(results)} 行，匹配 {found} 行"
+        if self.query_mode.currentIndex() == 0 and missing:
+            message += "；未找到的可把表格来源改成「直接查询数据源」再查一次"
+        self.statusBar().showMessage(message, 8000)
         self.refresh_logs()
 
     def copy_query_results(self) -> None:
@@ -598,12 +820,14 @@ class MainWindow(QMainWindow):
             if not path.lower().endswith(".xlsx"):
                 path += ".xlsx"
             self.output_path.setText(path)
+            self.persist_workspace_settings()
 
     def update_output_destination(self) -> None:
         google_mode = self.output_type.currentIndex() == 1
         self.google_output_url.setEnabled(google_mode)
         for widget in getattr(self, "local_output_widgets", []):
             widget.setEnabled(not google_mode)
+        self.persist_workspace_settings()
 
     def run_extract(self) -> None:
         output = self.output_path.text().strip()
@@ -615,6 +839,7 @@ class MainWindow(QMainWindow):
         if google_mode and not google_url:
             QMessageBox.warning(self, "缺少链接", "请填写目标 Google 表格链接。")
             return
+        self.persist_workspace_settings()
         engine = DataEngine(self.store)
         start = self.start_date.date().toPython()
         end = self.end_date.date().toPython()
@@ -624,6 +849,8 @@ class MainWindow(QMainWindow):
         sheet_name = self.output_sheet_name.text().strip() or "提取结果"
         self.store.set("google_output_url", google_url)
         self.store.set("google_output_sheet", sheet_name)
+        self.store.set("extract_destination_type", "google" if google_mode else "local")
+        self.store.set("extract_output_path", output)
         self.extract_status.setText("正在提取…")
         self.run_task(
             lambda: engine.extract(
@@ -727,17 +954,19 @@ class MainWindow(QMainWindow):
                 field = alias_lookup.get(str(header).strip().casefold(), str(header).strip())
                 if field and field not in fields:
                     fields.append(field)
-        current_query = self.query_field.currentText() if hasattr(self, "query_field") else ""
+        restoring = self._restoring_settings
+        self._restoring_settings = True
         current_date = self.extract_date_field.currentText() if hasattr(self, "extract_date_field") else ""
-        for combo, current in ((self.query_field, current_query), (self.extract_date_field, current_date)):
-            combo.clear()
-            combo.addItems(fields)
-            if current in fields:
-                combo.setCurrentText(current)
-        if "号码" in fields:
-            self.query_field.setCurrentText("号码")
-        if "日期" in fields:
-            self.extract_date_field.setCurrentText("日期")
+        saved_date = str(self.store.get("extract_date_field", "") or "")
+        if hasattr(self, "extract_date_field"):
+            self.extract_date_field.clear()
+            self.extract_date_field.addItems(fields)
+            date_field = current_date if current_date in fields else (saved_date if saved_date in fields else ("日期" if "日期" in fields else (fields[0] if fields else "")))
+            if date_field:
+                self.extract_date_field.setCurrentText(date_field)
+        self._restoring_settings = restoring
+        self.refresh_query_source_picker()
+        self.refresh_query_fields()
 
     def refresh_logs(self) -> None:
         rows = self.store.read_logs()
@@ -756,6 +985,76 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "清空日志", "确定清空全部运行日志吗？") == QMessageBox.Yes:
             self.store.clear_logs()
             self.refresh_logs()
+
+    def check_updates_silent(self) -> None:
+        task = TaskThread(fetch_latest_release, self)
+        self.tasks.append(task)
+
+        def done(info: object) -> None:
+            self.tasks.remove(task)
+            task.deleteLater()
+            if not isinstance(info, dict):
+                return
+            if is_newer(str(info.get("version") or ""), APP_VERSION):
+                self.statusBar().showMessage(
+                    f"发现新版本 v{info['version']}，可点击「检查更新」下载",
+                    20000,
+                )
+
+        def failed(_message: str) -> None:
+            if task in self.tasks:
+                self.tasks.remove(task)
+            task.deleteLater()
+
+        task.succeeded.connect(done)
+        task.failed.connect(failed)
+        task.start()
+
+    def _set_update_buttons_enabled(self, enabled: bool) -> None:
+        self.sidebar_update_button.setEnabled(enabled)
+        if hasattr(self, "update_button"):
+            self.update_button.setEnabled(enabled)
+
+    def check_updates(self) -> None:
+        self._set_update_buttons_enabled(False)
+        self.statusBar().showMessage("正在检查更新…")
+        task = TaskThread(fetch_latest_release, self)
+        self.tasks.append(task)
+
+        def done(info: object) -> None:
+            self._set_update_buttons_enabled(True)
+            self.tasks.remove(task)
+            task.deleteLater()
+            if isinstance(info, dict):
+                self.show_update_result(info)
+
+        def failed(message: str) -> None:
+            self._set_update_buttons_enabled(True)
+            self.statusBar().showMessage("检查更新失败", 8000)
+            if task in self.tasks:
+                self.tasks.remove(task)
+            task.deleteLater()
+            QMessageBox.critical(self, "检查更新失败", message)
+
+        task.succeeded.connect(done)
+        task.failed.connect(failed)
+        task.start()
+
+    def show_update_result(self, info: dict[str, str]) -> None:
+        self._set_update_buttons_enabled(True)
+        latest = str(info.get("version") or "")
+        if is_newer(latest, APP_VERSION):
+            box = QMessageBox(self)
+            box.setWindowTitle("发现新版本")
+            box.setText(f"当前版本：v{APP_VERSION}\n最新版本：v{latest}")
+            box.setInformativeText("下载后安装即可覆盖更新。")
+            open_button = box.addButton("打开下载页", QMessageBox.AcceptRole)
+            box.addButton("稍后", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is open_button:
+                QDesktopServices.openUrl(QUrl(str(info.get("url") or RELEASES_URL)))
+            return
+        QMessageBox.information(self, "已是最新", f"当前已经是最新版本 v{APP_VERSION}。")
 
     def choose_default_credential(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择服务账号 JSON", "", "JSON 文件 (*.json)")
@@ -800,6 +1099,8 @@ QMainWindow, QWidget { background: #f7f9fc; color: #172033; font-family: "Micros
 #sidebar QLabel { background: transparent; }
 #brand { color: white; font-size: 26px; font-weight: 700; }
 #sidebarMuted { color: #9eb7d2; }
+#sidebar QPushButton { background: transparent; border: 1px solid #3d6a94; color: #cfe1f5; padding: 6px 10px; }
+#sidebar QPushButton:hover { border-color: #0ea5e9; color: white; }
 #navigation { background: transparent; border: 0; color: #cfe1f5; outline: none; }
 #navigation::item { padding: 12px 13px; border-radius: 7px; margin-bottom: 4px; }
 #navigation::item:selected { background: #0ea5e9; color: white; }
@@ -824,6 +1125,7 @@ QStatusBar { background: white; border-top: 1px solid #e2e8f0; color: #475569; }
 def create_app(icon_path: Path | None = None, data_dir: Path | None = None) -> tuple[QApplication, MainWindow]:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
+    app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("SheetDataHub")
     app.setStyle("Fusion")
     # 某些精简 Windows/离屏环境不会自动枚举中文字体，显式注册系统字体。

@@ -14,6 +14,8 @@ class SourceConfig:
     header_row: int = 1
     enabled: bool = True
     credential_path: str = ""
+    column_schema_enabled: bool = False
+    column_schema: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -83,6 +83,18 @@ class ConfigStore:
             "column_schema": [],
             "google_output_url": "",
             "google_output_sheet": "提取结果",
+            "extract_destination_type": "local",
+            "extract_output_path": "",
+            "query_source": "extract",
+            "query_field": "号码",
+            "query_fields_by_mode": {},
+            "query_direct_source_id": "",
+            "query_exact": True,
+            "extract_mode": "aggregate",
+            "extract_dedup_fields": "号码,日期",
+            "extract_date_field": "日期",
+            "extract_column_schema_enabled": False,
+            "extract_column_schema": [],
         }
         for key, value in defaults.items():
             if self.get(key, None) is None:

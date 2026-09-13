@@ -9,9 +9,11 @@ import tempfile
 import winreg
 from pathlib import Path
 
+from sheet_hub.version import APP_VERSION
+
 APP_NAME = "表数通"
 APP_ID = "SheetDataHub"
-VERSION = "1.1.3"
+VERSION = APP_VERSION
 EXE_NAME = "SheetDataHub.exe"
 MB_OK, MB_YESNO = 0, 4
 MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONERROR = 0x40, 0x20, 0x10

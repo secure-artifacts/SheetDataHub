@@ -26,7 +26,7 @@ python app.py
 
 | 文件 | 说明 |
 |------|------|
-| `SheetDataHub-Setup-1.1.3.exe` | Windows 安装程序（推荐） |
+| `SheetDataHub-Setup.exe` | Windows 安装程序（推荐） |
 | `SheetDataHub-windows.zip` | 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
 
 系统要求：Windows 10 / 11（64 位）。
@@ -37,7 +37,7 @@ python app.py
 
 ```bash
 gh attestation verify ./SheetDataHub-windows.zip --repo secure-artifacts/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup-1.1.3.exe --repo secure-artifacts/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup.exe --repo secure-artifacts/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。

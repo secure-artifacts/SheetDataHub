@@ -87,6 +87,24 @@ class AggregateDatabase:
             result.extend(Record(*row[:5], json.loads(row[5]), row[6]) for row in rows)
         return result
 
+    def sample_records(self, limit: int = 20) -> list[Record]:
+        remaining = max(1, int(limit))
+        result: list[Record] = []
+        for path in self.paths():
+            conn = sqlite3.connect(path)
+            try:
+                rows = conn.execute(
+                    "SELECT source_id,source_name,spreadsheet_id,sheet_name,row_number,payload,row_hash FROM records LIMIT ?",
+                    (remaining,),
+                ).fetchall()
+            finally:
+                conn.close()
+            result.extend(Record(*row[:5], json.loads(row[5]), row[6]) for row in rows)
+            remaining -= len(rows)
+            if remaining <= 0:
+                break
+        return result
+
     def query(self, field: str, value: str, exact: bool = True) -> list[Record]:
         needle = value.strip().casefold()
         result: list[Record] = []

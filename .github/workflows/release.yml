@@ -41,7 +41,7 @@ jobs:
           python -m PyInstaller --noconfirm --clean --distpath dist-installer --workpath build-installer SheetDataHubInstaller.spec
           $setup = Get-ChildItem dist-installer -Filter *.exe | Select-Object -First 1
           if (-not $setup) { throw 'Installer exe not found' }
-          Copy-Item -Path $setup.FullName -Destination dist_final\SheetDataHub-Setup-1.1.3.exe -Force
+          Copy-Item -Path $setup.FullName -Destination dist_final\SheetDataHub-Setup.exe -Force
           Get-ChildItem dist_final | Format-Table Name, Length
 
       - name: Attest Build Provenance

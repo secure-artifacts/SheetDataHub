@@ -13,7 +13,8 @@ from sheet_hub.config_store import ConfigStore
 from sheet_hub.database import AggregateDatabase
 from sheet_hub.engine import DataEngine, parse_date
 from sheet_hub.models import Record, SourceConfig
-from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry
+from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry, parse_schema_lines
+from sheet_hub.version import APP_VERSION, is_newer, parse_version
 
 
 class RuleTests(unittest.TestCase):
@@ -26,6 +27,13 @@ class RuleTests(unittest.TestCase):
         selected, missing = choose_sheets(["订单A", "订单B"], ["订单A", "订单B", "不存在"], ["订单B"])
         self.assertEqual(selected, ["订单A"])
         self.assertEqual(missing, ["不存在"])
+
+    def test_version_compare(self):
+        self.assertEqual(parse_version("v1.2.0"), (1, 2, 0))
+        self.assertTrue(is_newer("1.2.1", "1.2.0"))
+        self.assertFalse(is_newer("1.2.0", "1.2.0"))
+        self.assertFalse(is_newer("1.1.9", APP_VERSION))
+        self.assertEqual(parse_schema_lines("专页ID\n姓名\n\n号码\n"), ["专页ID", "姓名", "", "号码"])
 
     def test_space_separated_sheet_exclusions_are_supported(self):
         selected, _ = choose_sheets(["数据", "Index", "清理", "备份链接"], [], ["Index 清理 备份链接"])
@@ -70,6 +78,18 @@ class RuleTests(unittest.TestCase):
             reopened = ConfigStore(directory)
             self.assertIn("手机号码", reopened.get("field_aliases")["号码"])
 
+    def test_query_source_is_remembered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(directory)
+            self.assertEqual(store.get("query_source"), "extract")
+            store.set("query_source", "direct")
+            store.set("google_output_url", "https://docs.google.com/spreadsheets/d/abc")
+            store.set("google_output_sheet", "提取结果")
+            reopened = ConfigStore(directory)
+            self.assertEqual(reopened.get("query_source"), "direct")
+            self.assertEqual(reopened.get("google_output_sheet"), "提取结果")
+            self.assertTrue(reopened.get("query_exact"))
+
 
 class DatabaseTests(unittest.TestCase):
     def test_sharding_and_query(self):
@@ -106,6 +126,57 @@ class DatabaseTests(unittest.TestCase):
             results = engine.query_many("号码", ["123", "999"])
             self.assertEqual(results[0][1].sheet_name, "1008-李薇")
             self.assertIsNone(results[1][1])
+
+    def test_query_extract_table_is_faster_subset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            extract_path = Path(directory) / "extract.xlsx"
+            DataEngine._write_xlsx(
+                extract_path,
+                [
+                    Record("s", "源", "g", "1008-李薇", 2, {"号码": "123", "名字": "李薇", "日期": "2026-09-13"}, "h1"),
+                    Record("s", "源", "g", "2002-王强", 3, {"号码": "456", "名字": "王强", "日期": "2026-09-12"}, "h2"),
+                ],
+                "提取结果",
+            )
+            other = openpyxl.load_workbook(extract_path)
+            extra = other.create_sheet("其他页")
+            extra.append(["来源", "号码"])
+            extra.append(["不该读", "999"])
+            other.save(extract_path)
+            other.close()
+            results = engine.query_many(
+                "号码",
+                ["123", "999"],
+                source="extract",
+                extract_target=str(extract_path),
+                extract_sheet="提取结果",
+            )
+            self.assertEqual(results[0][1].sheet_name, "1008-李薇")
+            self.assertEqual(results[0][1].values["号码"], "123")
+            self.assertIsNone(results[1][1])
+            found = engine.query(
+                "号码",
+                "456",
+                source="extract",
+                extract_target=str(extract_path),
+                extract_sheet="提取结果",
+            )
+            self.assertEqual(found[0].values["名字"], "王强")
+            headers = engine.list_query_fields(
+                "extract", str(extract_path), "提取结果",
+            )
+            self.assertIn("来源", headers)
+            self.assertTrue(any(name in {"号码", "手机号码"} for name in headers))
+            by_header = engine.query(
+                "名字",
+                "李薇",
+                source="extract",
+                extract_target=str(extract_path),
+                extract_sheet="提取结果",
+            )
+            self.assertEqual(by_header[0].values["号码"], "123")
 
     def test_extract_uses_configured_sheet_and_source_first(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -157,6 +228,50 @@ class WorkbookTests(unittest.TestCase):
             records = reader.read(source)
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0].values["号码"], "10086")
+
+    def test_sources_can_use_different_column_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            short_path = Path(directory) / "short.xlsx"
+            long_path = Path(directory) / "long.xlsx"
+            short = openpyxl.Workbook()
+            short.active.title = "短表"
+            short.active.append(["a", "b", "ignore"])
+            short.active.append(["page-1", "13800138000", "skip"])
+            short.save(short_path)
+            long = openpyxl.Workbook()
+            long.active.title = "长表"
+            long.active.append(["a", "b", "c", "d"])
+            long.active.append(["page-2", "李薇", "https://example.test", "258851758692"])
+            long.save(long_path)
+            store = ConfigStore(Path(directory) / "config")
+            store.save_source(SourceConfig(
+                "short", "短表", str(short_path),
+                column_schema_enabled=True,
+                column_schema=["专页ID", "手机号码"],
+            ))
+            store.save_source(SourceConfig(
+                "long", "长表", str(long_path),
+                column_schema_enabled=True,
+                column_schema=["专页ID", "姓名", "评论贴文", "手机号码"],
+            ))
+            engine = DataEngine(store)
+            records = engine.read_sources()
+            by_source = {record.source_id: record for record in records}
+            self.assertEqual(by_source["short"].values["专页ID"], "page-1")
+            self.assertEqual(by_source["short"].values["号码"], "13800138000")
+            self.assertNotIn("ignore", by_source["short"].values)
+            self.assertEqual(by_source["long"].values["名字"], "李薇")
+            self.assertEqual(by_source["long"].values["号码"], "258851758692")
+            self.assertEqual(by_source["long"].values["评论贴文"], "https://example.test")
+            short_fields = engine.list_query_fields("direct", source_id="short")
+            long_fields = engine.list_query_fields("direct", source_id="long")
+            self.assertIn("手机号码", short_fields)
+            self.assertNotIn("评论贴文", short_fields)
+            self.assertIn("评论贴文", long_fields)
+            self.assertEqual(
+                engine.query("手机号码", "13800138000", source="direct", source_id="short")[0].source_id,
+                "short",
+            )
 
     def test_manual_column_count_and_headers(self):
         with tempfile.TemporaryDirectory() as directory:

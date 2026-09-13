@@ -49,6 +49,15 @@ def split_names(text: str | Iterable[str]) -> list[str]:
     return [item.strip() for item in re.split(r"[,，;；\n]+", text) if item.strip()]
 
 
+def parse_schema_lines(text: str | Iterable[str]) -> list[str]:
+    if not isinstance(text, str):
+        return [str(item).strip() for item in text]
+    lines = [line.strip() for line in text.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
 def choose_sheets(all_names: list[str], include: list[str], exclude: list[str]) -> tuple[list[str], list[str]]:
     available_names = {name.casefold() for name in all_names}
 

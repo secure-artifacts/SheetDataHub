@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SheetDataHub-Setup-1.1.3',
+    name='SheetDataHub-Setup',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

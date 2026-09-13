@@ -53,20 +53,39 @@ class DataEngine:
         self.store.log(level, operation, message, detail)
         self.progress(message)
 
-    def _reader(self, operation: str) -> SourceReader:
-        schema = self.store.get("column_schema", []) if self.store.get("column_schema_enabled", False) else []
+    def _schema_for_source(self, source: SourceConfig | None, use_schema: bool) -> list[str]:
+        if not use_schema:
+            return []
+        if source is not None and source.column_schema_enabled and source.column_schema:
+            return [str(name).strip() for name in source.column_schema]
+        if self.store.get("column_schema_enabled", False):
+            return [str(name).strip() for name in self.store.get("column_schema", [])]
+        return []
+
+    def _reader(
+        self,
+        operation: str,
+        *,
+        source: SourceConfig | None = None,
+        use_schema: bool = True,
+        schema: list[str] | None = None,
+        global_excludes: list[str] | None = None,
+    ) -> SourceReader:
+        resolved = schema if schema is not None else self._schema_for_source(source, use_schema)
+        excludes = self.store.get("global_excludes", []) if global_excludes is None else global_excludes
         return SourceReader(
             self.store.get("field_aliases", {}),
-            self.store.get("global_excludes", []),
+            excludes,
             lambda level, message: self._log(operation, level, message),
-            schema,
+            resolved,
         )
 
-    def read_sources(self, operation: str = "读取数据源") -> list[Record]:
+    def read_sources(self, operation: str = "读取数据源", source_id: str = "") -> list[Record]:
         sources = [source for source in self.store.load_sources() if source.enabled]
+        if source_id.strip():
+            sources = [source for source in sources if source.id == source_id.strip()]
         if not sources:
-            raise ValueError("没有启用的数据源")
-        reader = self._reader(operation)
+            raise ValueError("没有启用的数据源" if not source_id.strip() else "没有找到所选数据源")
         records: list[Record] = []
         failures = 0
         for source in sources:
@@ -74,7 +93,7 @@ class DataEngine:
                 if not source.credential_path:
                     source.credential_path = str(self.store.get("credential_path", "")).strip()
                 self._log(operation, "INFO", f"开始读取：{source.name}")
-                loaded = reader.read(source)
+                loaded = self._reader(operation, source=source).read(source)
                 records.extend(loaded)
                 self._log(operation, "INFO", f"完成读取：{source.name}，共 {len(loaded)} 行")
             except Exception as exc:
@@ -96,21 +115,156 @@ class DataEngine:
         self._log(operation, "INFO", f"汇总完成：写入 {row_count} 行，使用 {db_count} 个数据库文件")
         return {"rows": row_count, "databases": db_count}
 
-    def query(self, field: str, value: str, direct: bool = False, exact: bool = True) -> list[Record]:
-        operation = "直接查询" if direct else "汇总库查询"
-        self._log(operation, "INFO", f"查询字段“{field}”，值“{value}”")
-        if direct:
-            records = self.read_sources(operation)
-            needle = self._match_value(field, value)
-            result = [
-                record for record in records
-                if ((self._match_value(field, record.values.get(field, "")) == needle) if exact
-                    else (needle in self._match_value(field, record.values.get(field, ""))))
-            ]
-        else:
-            result = self.database.query(field, value, exact)
-        self._log(operation, "INFO", f"查询完成：匹配 {len(result)} 行")
+    def read_extract_table(self, target: str, sheet_name: str = "") -> list[Record]:
+        path_or_url = str(target or "").strip()
+        if not path_or_url:
+            raise ValueError("请先在「时间提取」页填写提取表的目标表格链接或输出文件")
+        sheet = str(sheet_name or "").strip() or "提取结果"
+        operation = "查询提取表"
+        self._log(operation, "INFO", f"读取提取表：{path_or_url} / {sheet}")
+        source = SourceConfig(
+            id="extract-table",
+            name="提取表",
+            url=path_or_url,
+            include_sheets=[sheet],
+            credential_path=str(self.store.get("credential_path", "")).strip(),
+        )
+        extract_schema = [str(name).strip() for name in self.store.get("extract_column_schema", [])]
+        use_extract_schema = bool(self.store.get("extract_column_schema_enabled", False) and extract_schema)
+        records = self._reader(
+            operation,
+            use_schema=use_extract_schema,
+            schema=extract_schema if use_extract_schema else None,
+            global_excludes=[],
+        ).read(source)
+        for record in records:
+            origin = str(record.values.get("来源", "")).strip()
+            if origin:
+                record.sheet_name = origin
+        self._log(operation, "INFO", f"提取表读取完成：{len(records)} 行")
+        return records
+
+    @staticmethod
+    def query_source_mode(source: str | None, direct: bool) -> str:
+        mode = str(source or "").strip()
+        if mode in {"aggregate", "extract", "direct"}:
+            return mode
+        return "direct" if direct else "aggregate"
+
+    @staticmethod
+    def _unique_headers(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            name = str(item).strip()
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                result.append(name)
         return result
+
+    def _canonical_field(self, field: str) -> str:
+        folded = str(field).strip().casefold()
+        if not folded:
+            return field
+        for canonical, names in self.store.get("field_aliases", {}).items():
+            options = [canonical, *names]
+            if folded in {str(name).strip().casefold() for name in options}:
+                return str(canonical)
+        return str(field).strip()
+
+    def _field_value(self, record: Record, field: str) -> str:
+        folded = str(field).strip().casefold()
+        aliases = self.store.get("field_aliases", {})
+        candidates = [str(field).strip()]
+        for canonical, names in aliases.items():
+            options = [str(canonical), *[str(name) for name in names]]
+            if folded in {name.strip().casefold() for name in options if name.strip()}:
+                candidates.extend(options)
+                break
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.strip().casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            direct = record.values.get(candidate, "")
+            if direct:
+                return str(direct)
+            for stored, value in record.values.items():
+                if str(stored).strip().casefold() == key and str(value).strip():
+                    return str(value)
+        return ""
+
+    def _peek_headers(self, target: str, sheet_name: str = "") -> list[str]:
+        path = Path(str(target or "").strip())
+        if not path.exists() or path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            return []
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            names = workbook.sheetnames
+            if not names:
+                return []
+            title = sheet_name.strip() if sheet_name.strip() in names else names[0]
+            row = next(workbook[title].iter_rows(values_only=True), None)
+            return [str(cell).strip() for cell in (row or []) if str(cell or "").strip()]
+        finally:
+            workbook.close()
+
+    def list_query_fields(
+        self,
+        mode: str = "extract",
+        extract_target: str = "",
+        extract_sheet: str = "",
+        source_id: str = "",
+    ) -> list[str]:
+        fallback = list(self.store.get("field_aliases", {}).keys())
+        mode = self.query_source_mode(mode, False)
+        if mode == "extract":
+            schema = [str(name).strip() for name in self.store.get("extract_column_schema", []) if str(name).strip()]
+            if self.store.get("extract_column_schema_enabled", False) and schema:
+                return self._unique_headers([*schema, *fallback])
+            peeked = self._peek_headers(extract_target, extract_sheet)
+            if peeked:
+                return self._unique_headers(peeked)
+            return self._unique_headers(["来源", *fallback])
+        if mode == "direct":
+            sources = [source for source in self.store.load_sources() if source.enabled]
+            if source_id.strip():
+                sources = [source for source in sources if source.id == source_id.strip()]
+            headers: list[str] = []
+            for source in sources:
+                if source.column_schema_enabled and source.column_schema:
+                    headers.extend(str(name).strip() for name in source.column_schema)
+                    continue
+                peeked = self._peek_headers(source.url, (source.include_sheets or [""])[0])
+                if peeked:
+                    headers.extend(peeked)
+                elif self.store.get("column_schema_enabled", False):
+                    headers.extend(str(name).strip() for name in self.store.get("column_schema", []))
+            return self._unique_headers(headers) or self._unique_headers(fallback)
+        headers = []
+        for record in self.database.sample_records(20):
+            headers.extend(record.values.keys())
+        if self.store.get("column_schema_enabled", False):
+            headers.extend(str(name).strip() for name in self.store.get("column_schema", []))
+        return self._unique_headers(headers) or self._unique_headers(fallback)
+
+    def query(
+        self,
+        field: str,
+        value: str,
+        direct: bool = False,
+        exact: bool = True,
+        source: str | None = None,
+        extract_target: str = "",
+        extract_sheet: str = "",
+        source_id: str = "",
+    ) -> list[Record]:
+        results = self.query_many(
+            field, [value], direct, exact, source, extract_target, extract_sheet, source_id,
+        )
+        return [record for _, record in results if record is not None]
 
     def query_many(
         self,
@@ -118,20 +272,31 @@ class DataEngine:
         values: list[str],
         direct: bool = False,
         exact: bool = True,
+        source: str | None = None,
+        extract_target: str = "",
+        extract_sheet: str = "",
+        source_id: str = "",
     ) -> list[tuple[str, Record | None]]:
-        operation = "批量直接查询" if direct else "批量汇总库查询"
+        mode = self.query_source_mode(source, direct)
+        operation = {"direct": "批量直接查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
         queries = list(dict.fromkeys(value.strip() for value in values if value.strip()))
         if not queries:
             raise ValueError("没有可查询的号码")
         self._log(operation, "INFO", f"开始批量查询：{len(queries)} 个值，字段“{field}”")
-        records = self.read_sources(operation) if direct else self.database.all_records()
+        if mode == "extract":
+            records = self.read_extract_table(extract_target, extract_sheet)
+        elif mode == "direct":
+            records = self.read_sources(operation, source_id)
+        else:
+            records = self.database.all_records()
+        canonical = self._canonical_field(field)
         results: list[tuple[str, Record | None]] = []
         matched_inputs = 0
         for query_value in queries:
-            needle = self._match_value(field, query_value)
+            needle = self._match_value(canonical, query_value)
             matches = []
             for record in records:
-                haystack = self._match_value(field, record.values.get(field, ""))
+                haystack = self._match_value(canonical, self._field_value(record, field))
                 if (haystack == needle) if exact else (needle in haystack):
                     matches.append(record)
             if matches:
