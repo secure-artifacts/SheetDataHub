@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='表数通-安装程序-v1.1.3',
+    name='SheetDataHub-Setup-1.1.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
