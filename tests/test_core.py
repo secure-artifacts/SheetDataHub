@@ -89,6 +89,7 @@ class RuleTests(unittest.TestCase):
             self.assertEqual(reopened.get("query_source"), "direct")
             self.assertEqual(reopened.get("google_output_sheet"), "提取结果")
             self.assertTrue(reopened.get("query_exact"))
+            self.assertFalse(reopened.get("query_fuzzy"))
 
 
 class DatabaseTests(unittest.TestCase):
@@ -126,6 +127,27 @@ class DatabaseTests(unittest.TestCase):
             results = engine.query_many("号码", ["123", "999"])
             self.assertEqual(results[0][1].sheet_name, "1008-李薇")
             self.assertIsNone(results[1][1])
+
+    def test_fuzzy_source_query_matches_original_and_corrected_sheet_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "1233-赵刚", 2, {"号码": "123"}, "h1")
+            ])
+            for value in ("赵刚", "1233", "1233-赵刚", "赵刚-1233-专页后台"):
+                results = engine.query_many("来源", [value], exact=False)
+                self.assertEqual(results[0][1].sheet_name, "1233-赵刚")
+
+    def test_exact_source_query_matches_corrected_sheet_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "1233-赵刚", 2, {"号码": "123"}, "h1")
+            ])
+            results = engine.query_many("来源", ["赵刚-1233-专页后台"], exact=True)
+            self.assertEqual(results[0][1].sheet_name, "1233-赵刚")
 
     def test_query_extract_table_is_faster_subset(self):
         with tempfile.TemporaryDirectory() as directory:

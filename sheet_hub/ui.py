@@ -451,11 +451,12 @@ class MainWindow(QMainWindow):
         self.query_table_label = QLabel("数据表")
         self.query_source_pick = QComboBox()
         self.query_source_pick.setMinimumWidth(140)
-        self.query_exact = QCheckBox("精确匹配")
-        self.query_exact.setChecked(bool(self.store.get("query_exact", True)))
+        self.query_fuzzy = QCheckBox("模糊匹配")
+        self.query_fuzzy.setChecked(bool(self.store.get("query_fuzzy", False)))
+        self.query_fuzzy.setToolTip("勾选后可用姓名、编号或部分文字查询；查询来源时也会匹配修正格式")
         self.query_mode.currentIndexChanged.connect(self.on_query_mode_changed)
         self.query_source_pick.currentIndexChanged.connect(self.on_query_table_changed)
-        self.query_exact.toggled.connect(self.persist_workspace_settings)
+        self.query_fuzzy.toggled.connect(self.persist_workspace_settings)
         self.query_field.currentTextChanged.connect(self.persist_workspace_settings)
         button = QPushButton("查询")
         button.setObjectName("primary")
@@ -470,7 +471,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel("查询字段"))
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
-        bar.addWidget(self.query_exact)
+        bar.addWidget(self.query_fuzzy)
         bar.addWidget(button)
         bar.addWidget(self.copy_query_button)
         self.query_table = QTableWidget()
@@ -739,7 +740,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "query_mode"):
             self.store.set("query_source", QUERY_SOURCES[self.query_mode.currentIndex()])
-            self.store.set("query_exact", self.query_exact.isChecked())
+            self.store.set("query_fuzzy", self.query_fuzzy.isChecked())
             field = self.query_field.currentText().strip()
             if field:
                 self.store.set("query_field", field)
@@ -868,7 +869,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "请选择", "请选择或输入要查询的字段。")
             return
         source = self.current_query_mode()
-        exact = self.query_exact.isChecked()
+        exact = not self.query_fuzzy.isChecked()
         extract_target, extract_sheet = self.extract_query_target()
         source_id = self.current_query_source_id()
         if source == "extract" and not extract_target:
@@ -885,10 +886,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def corrected_source(source: str) -> str:
-        if "-" not in source:
-            return source
-        prefix, remainder = source.split("-", 1)
-        return f"{remainder}-{prefix}-专页后台"
+        return DataEngine.corrected_source(source)
 
     @staticmethod
     def record_value(record: Record, *names: str) -> str:

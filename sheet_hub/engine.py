@@ -196,6 +196,19 @@ class DataEngine:
                     return str(value)
         return ""
 
+    @staticmethod
+    def corrected_source(source: str) -> str:
+        if "-" not in source:
+            return source
+        prefix, remainder = source.split("-", 1)
+        return f"{remainder}-{prefix}-专页后台"
+
+    def _query_values(self, record: Record, field: str) -> list[str]:
+        values = [self._field_value(record, field)]
+        if self._canonical_field(field).casefold() == "来源":
+            values.extend((record.sheet_name, self.corrected_source(record.sheet_name)))
+        return self._unique_headers(values)
+
     def _peek_headers(self, target: str, sheet_name: str = "") -> list[str]:
         path = Path(str(target or "").strip())
         if not path.exists() or path.suffix.lower() not in {".xlsx", ".xlsm"}:
@@ -296,8 +309,8 @@ class DataEngine:
             needle = self._match_value(canonical, query_value)
             matches = []
             for record in records:
-                haystack = self._match_value(canonical, self._field_value(record, field))
-                if (haystack == needle) if exact else (needle in haystack):
+                haystacks = [self._match_value(canonical, value) for value in self._query_values(record, field)]
+                if any((haystack == needle) if exact else (needle in haystack) for haystack in haystacks):
                     matches.append(record)
             if matches:
                 matched_inputs += 1

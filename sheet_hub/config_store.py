@@ -90,6 +90,7 @@ class ConfigStore:
             "query_fields_by_mode": {},
             "query_direct_source_id": "",
             "query_exact": True,
+            "query_fuzzy": False,
             "extract_mode": "aggregate",
             "extract_dedup_fields": "号码,日期",
             "extract_date_field": "日期",
