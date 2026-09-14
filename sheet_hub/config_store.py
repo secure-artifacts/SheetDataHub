@@ -183,3 +183,15 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO extracted(dedup_key,destination) VALUES(?,?)",
                 [(key, destination) for key in keys],
             )
+
+    def count_extracted(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM extracted").fetchone()
+        return int(row["total"] if row else 0)
+
+    def clear_extracted(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM extracted").fetchone()
+            total = int(row["total"] if row else 0)
+            conn.execute("DELETE FROM extracted")
+        return total

@@ -447,6 +447,14 @@ class DataEngine:
         if start > end:
             raise ValueError("开始日期不能晚于结束日期")
         records = self.read_sources(operation, source_id) if direct else self.database.all_records()
+        existing_keys = self._existing_extract_keys(
+            destination_type,
+            output,
+            output_sheet_name,
+            google_output_url,
+            dedup_fields,
+            operation,
+        )
         selected: list[tuple[Record, str]] = []
         skipped_invalid = 0
         skipped_duplicate = 0
@@ -457,14 +465,13 @@ class DataEngine:
                 continue
             if not start <= current <= end:
                 continue
-            parts = [self._field_value(record, field) for field in dedup_fields]
-            if not any(parts):
-                parts = [record.spreadsheet_id, record.sheet_name, str(record.row_number), record.row_hash]
-            key = hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
-            if self.store.was_extracted(key):
+            key = self._dedup_key(record, dedup_fields)
+            keys = self._dedup_keys(record, dedup_fields)
+            if keys & existing_keys or any(self.store.was_extracted(item) for item in keys):
                 skipped_duplicate += 1
                 continue
             selected.append((record, key))
+            existing_keys.update(keys)
         if records and skipped_invalid == len(records):
             raise ValueError(
                 f"日期字段“{date_field}”在读取的 {len(records)} 行中没有可识别日期。"
@@ -505,6 +512,161 @@ class DataEngine:
             f"提取完成：写入 {len(selected)} 行，排除重复 {skipped_duplicate} 行，日期无效 {skipped_invalid} 行",
         )
         return {"written": len(selected), "duplicates": skipped_duplicate, "invalid_dates": skipped_invalid}
+
+    def _dedup_parts(self, record: Record, dedup_fields: list[str]) -> list[str]:
+        parts = [self._field_value(record, field) for field in dedup_fields]
+        if not any(parts):
+            parts = [record.spreadsheet_id, record.sheet_name, str(record.row_number), record.row_hash]
+        return parts
+
+    def _legacy_dedup_key(self, record: Record, dedup_fields: list[str]) -> str:
+        return hashlib.sha256(
+            json.dumps(self._dedup_parts(record, dedup_fields), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _dedup_key(self, record: Record, dedup_fields: list[str]) -> str:
+        parts = self._dedup_parts(record, dedup_fields)
+        normalized = [self._match_value(self._field_kind(field), value) for field, value in zip(dedup_fields, parts)]
+        if len(normalized) != len(parts):
+            normalized = [str(value).strip() for value in parts]
+        return hashlib.sha256(json.dumps(normalized, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def _dedup_keys(self, record: Record, dedup_fields: list[str]) -> set[str]:
+        return {self._dedup_key(record, dedup_fields), self._legacy_dedup_key(record, dedup_fields)}
+
+    def _existing_extract_keys(
+        self,
+        destination_type: str,
+        output: str | Path,
+        output_sheet_name: str,
+        google_output_url: str,
+        dedup_fields: list[str],
+        operation: str,
+    ) -> set[str]:
+        if destination_type == "google":
+            if not google_output_url.strip():
+                return set()
+            return self._existing_google_extract_keys(
+                google_output_url,
+                output_sheet_name,
+                dedup_fields,
+                operation,
+            )
+        return self._existing_xlsx_extract_keys(Path(output), output_sheet_name, dedup_fields)
+
+    def _records_from_sheet_values(
+        self,
+        headers: list[str],
+        rows: list[list[object]],
+        sheet_name: str,
+    ) -> list[Record]:
+        clean_headers = [str(header or "").strip() for header in headers]
+        records: list[Record] = []
+        for index, row in enumerate(rows, start=2):
+            values: dict[str, str] = {}
+            for column, header in enumerate(clean_headers):
+                if not header:
+                    continue
+                value = row[column] if column < len(row) else ""
+                values[header] = str(value or "").strip()
+            if not any(values.values()):
+                continue
+            source_name = values.get("来源") or sheet_name
+            records.append(
+                Record(
+                    "extract-output",
+                    "提取目标表",
+                    "",
+                    str(source_name),
+                    index,
+                    values,
+                    "",
+                )
+            )
+        return records
+
+    def _keys_from_existing_rows(
+        self,
+        headers: list[str],
+        rows: list[list[object]],
+        sheet_name: str,
+        dedup_fields: list[str],
+    ) -> set[str]:
+        return {
+            self._dedup_key(record, dedup_fields)
+            for record in self._records_from_sheet_values(headers, rows, sheet_name)
+        }
+
+    def _existing_xlsx_extract_keys(
+        self,
+        path: Path,
+        sheet_name: str,
+        dedup_fields: list[str],
+    ) -> set[str]:
+        if not path.exists() or path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            return set()
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            safe_name = self._safe_sheet_name(sheet_name)
+            title = safe_name if safe_name in workbook.sheetnames else workbook.sheetnames[0]
+            sheet = workbook[title]
+            rows = list(sheet.iter_rows(values_only=True))
+            if len(rows) < 2:
+                return set()
+            headers = [str(cell or "").strip() for cell in rows[0]]
+            while headers and not headers[-1]:
+                headers.pop()
+            return self._keys_from_existing_rows(headers, [list(row) for row in rows[1:]], title, dedup_fields)
+        finally:
+            workbook.close()
+
+    def _existing_google_extract_keys(
+        self,
+        url: str,
+        sheet_name: str,
+        dedup_fields: list[str],
+        operation: str,
+    ) -> set[str]:
+        sid = spreadsheet_id(url)
+        if not sid:
+            raise ValueError("无法识别目标 Google 表格链接")
+        credential = str(self.store.get("credential_path", "")).strip()
+        if not credential:
+            credential = next(
+                (source.credential_path for source in self.store.load_sources() if source.credential_path),
+                "",
+            )
+        if not credential:
+            raise ValueError("写入 Google 表格需要在“设置”中配置服务账号 JSON")
+        logger = lambda level, message: self._log(operation, level, message)
+        client = SourceReader._gspread_client(credential)
+        http = client.http_client
+        metadata = google_retry(
+            lambda: http.fetch_sheet_metadata(
+                sid, params={"fields": "sheets.properties(sheetId,title)"}
+            ),
+            logger,
+        )
+        target_name = sheet_name.strip() or "提取结果"
+        sheet_names = {item["properties"]["title"] for item in metadata.get("sheets", [])}
+        if target_name not in sheet_names:
+            return set()
+        escaped_name = target_name.replace("'", "''")
+        response = google_retry(
+            lambda: http.values_get(
+                sid,
+                f"'{escaped_name}'!A:ZZZ",
+                params={"majorDimension": "ROWS", "valueRenderOption": "FORMATTED_VALUE"},
+            ),
+            logger,
+        )
+        values = response.get("values") or []
+        if len(values) < 2:
+            return set()
+        headers = [str(cell or "").strip() for cell in values[0]]
+        while headers and not headers[-1]:
+            headers.pop()
+        return self._keys_from_existing_rows(headers, values[1:], target_name, dedup_fields)
 
     def _preferred_export_headers(self, records: list[Record], prefer_record_headers: bool = False) -> list[str]:
         if self.store.get("extract_column_schema_enabled", False):
@@ -631,6 +793,11 @@ class DataEngine:
         rows = [[record.sheet_name, *[record.values.get(key, "") for key in fields]] for record in records]
         return headers, rows
 
+    @staticmethod
+    def _safe_sheet_name(sheet_name: str) -> str:
+        safe_name = "".join("_" if char in "[]:*?/\\" else char for char in sheet_name.strip())[:31]
+        return safe_name or "提取结果"
+
     @classmethod
     def _write_xlsx(
         cls,
@@ -642,12 +809,22 @@ class DataEngine:
         signature_header: str = "",
         signature_value: str = "",
     ) -> None:
-        workbook = openpyxl.Workbook()
-        sheet = workbook.active
-        safe_name = "".join("_" if char in "[]:*?/\\" else char for char in sheet_name.strip())[:31]
-        sheet.title = safe_name or "提取结果"
+        safe_name = cls._safe_sheet_name(sheet_name)
+        if path.exists():
+            workbook = openpyxl.load_workbook(path)
+            sheet = workbook[safe_name] if safe_name in workbook.sheetnames else workbook.create_sheet(safe_name)
+        else:
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = safe_name
         export_headers, default_rows = cls._export_rows(records)
-        headers = headers or export_headers
+        existing_header = [
+            str(cell.value or "").strip()
+            for cell in sheet[1]
+        ] if sheet.max_row >= 1 else []
+        while existing_header and not existing_header[-1]:
+            existing_header.pop()
+        headers = existing_header or headers or export_headers
         rows = cls._rows_for_headers(
             records,
             headers,
@@ -655,9 +832,14 @@ class DataEngine:
             signature_header,
             signature_value,
         ) if headers != export_headers or aliases or signature_header else default_rows
-        sheet.append(headers)
-        for row in rows:
-            sheet.append(row)
+        if not existing_header:
+            for column, header in enumerate(headers, start=1):
+                sheet.cell(row=1, column=column, value=header)
+        if rows:
+            sheet.insert_rows(2, amount=len(rows))
+            for row_index, row in enumerate(rows, start=2):
+                for column, value in enumerate(row, start=1):
+                    sheet.cell(row=row_index, column=column, value=value)
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
         for column in sheet.columns:

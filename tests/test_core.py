@@ -156,6 +156,17 @@ class RuleTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_clear_extract_cache_only_removes_local_dedup_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.mark_extracted(["k1", "k2"], "目标")
+            store.log("INFO", "测试", "保留日志")
+            self.assertEqual(store.count_extracted(), 2)
+            self.assertEqual(store.clear_extracted(), 2)
+            self.assertEqual(store.count_extracted(), 0)
+            self.assertFalse(store.was_extracted("k1"))
+            self.assertEqual(len(store.read_logs()), 1)
+
     def test_sharding_and_query(self):
         with tempfile.TemporaryDirectory() as directory:
             db = AggregateDatabase(directory, 1000)
@@ -276,6 +287,75 @@ class DatabaseTests(unittest.TestCase):
             )
             self.assertEqual(first["written"], 1)
             self.assertEqual(second["duplicates"], 1)
+
+    def test_extract_dedup_reads_existing_output_sheet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "existing.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "提取结果"
+            sheet.append(["来源", "手机号码", "日期"])
+            sheet.append(["历史来源", "258-851-758692", "2026-09-13"])
+            workbook.save(output)
+            workbook.close()
+
+            store = ConfigStore(root / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record(
+                    "s", "源", "g", "新来源", 2,
+                    {"号码": "258851758692", "日期": "2026-09-13"},
+                    "h1",
+                ),
+            ])
+            result = engine.extract(
+                "日期", date(2026, 9, 1), date(2026, 9, 30),
+                output, ["号码", "日期"], output_sheet_name="提取结果",
+            )
+            self.assertEqual(result["written"], 0)
+            self.assertEqual(result["duplicates"], 1)
+            reopened = openpyxl.load_workbook(output, data_only=True)
+            try:
+                rows = list(reopened["提取结果"].iter_rows(values_only=True))
+            finally:
+                reopened.close()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1][0], "历史来源")
+
+    def test_extract_inserts_new_rows_at_top_of_existing_xlsx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "existing.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "提取结果"
+            sheet.append(["来源", "号码", "日期"])
+            sheet.append(["旧来源", "111", "2026-09-01"])
+            workbook.save(output)
+            workbook.close()
+
+            store = ConfigStore(root / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record(
+                    "s", "源", "g", "新来源", 2,
+                    {"号码": "222", "日期": "2026-09-13"},
+                    "h1",
+                ),
+            ])
+            result = engine.extract(
+                "日期", date(2026, 9, 1), date(2026, 9, 30),
+                output, ["号码", "日期"], output_sheet_name="提取结果",
+            )
+            self.assertEqual(result["written"], 1)
+            reopened = openpyxl.load_workbook(output, data_only=True)
+            try:
+                rows = list(reopened["提取结果"].iter_rows(values_only=True))
+            finally:
+                reopened.close()
+            self.assertEqual(rows[1], ("新来源", "222", "2026-09-13"))
+            self.assertEqual(rows[2], ("旧来源", "111", "2026-09-01"))
 
     def test_direct_extract_can_limit_source_and_adds_source_header(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -612,6 +692,54 @@ class WorkbookTests(unittest.TestCase):
                 )
         self.assertEqual(http.written[0], ["来源", "号码"])
         self.assertEqual(http.written[1], ["渠道A", "123"])
+
+    def test_google_extract_dedup_reads_existing_target_sheet(self):
+        existing = ["来源", "手机号码", "日期"]
+
+        class FakeHttp:
+            def __init__(self):
+                self.inserted = []
+                self.written = []
+
+            def fetch_sheet_metadata(self, key, params=None):
+                return {"sheets": [{"properties": {"sheetId": 1, "title": "提取结果"}}]}
+
+            def values_get(self, key, range_name, params=None):
+                if str(range_name).endswith("!A:ZZZ"):
+                    return {"values": [existing, ["旧来源", "258-851-758692", "2026-09-13"]]}
+                return {"values": [existing]}
+
+            def batch_update(self, key, body=None):
+                self.inserted.extend(body["requests"])
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.written.extend(body["values"])
+
+        http = FakeHttp()
+        client = SimpleNamespace(http_client=http)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.set("credential_path", "fake.json")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record(
+                    "s", "源", "g", "新来源", 2,
+                    {"号码": "258851758692", "日期": "2026-09-13"},
+                    "h1",
+                ),
+            ])
+            with patch.object(SourceReader, "_gspread_client", return_value=client):
+                result = engine.extract(
+                    "日期", date(2026, 9, 1), date(2026, 9, 30),
+                    Path(directory) / "unused.xlsx", ["号码", "日期"],
+                    destination_type="google",
+                    google_output_url="https://docs.google.com/spreadsheets/d/abcdefghijklmnopqrstuvwxyz",
+                    output_sheet_name="提取结果",
+                )
+        self.assertEqual(result["written"], 0)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(http.inserted, [])
+        self.assertEqual(http.written, [])
 
     def test_google_output_uses_existing_alias_header_order(self):
         existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期"]

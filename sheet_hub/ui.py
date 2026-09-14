@@ -633,10 +633,16 @@ class MainWindow(QMainWindow):
         self.extract_button = QPushButton("开始提取")
         self.extract_button.setObjectName("primary")
         self.extract_button.clicked.connect(self.run_extract)
+        self.clear_extract_cache_button = QPushButton("清除本地排重缓存")
+        self.clear_extract_cache_button.clicked.connect(self.clear_extract_cache)
+        extract_actions = QHBoxLayout()
+        extract_actions.addWidget(self.extract_button)
+        extract_actions.addWidget(self.clear_extract_cache_button)
+        extract_actions.addStretch()
         self.extract_status = QLabel("等待运行")
         self.extract_status.setObjectName("muted")
         layout.addWidget(card)
-        layout.addWidget(self.extract_button, 0, Qt.AlignLeft)
+        layout.addLayout(extract_actions)
         layout.addWidget(self.extract_status)
         layout.addStretch()
         return page
@@ -1166,6 +1172,26 @@ class MainWindow(QMainWindow):
             self.extract_button,
             self.extract_failed,
         )
+
+    def clear_extract_cache(self) -> None:
+        total = self.store.count_extracted()
+        if total <= 0:
+            QMessageBox.information(self, "本地排重缓存", "当前没有本地提取排重缓存。")
+            self.extract_status.setText("本地排重缓存为空。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除本地排重缓存",
+            f"确定清除 {total} 条本地提取排重缓存吗？\n\n"
+            "这不会删除数据源、字段配置、汇总库或目标表格数据。清除后仍会根据目标提取表已有行继续排重。",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        removed = self.store.clear_extracted()
+        self.store.log("INFO", "时间提取", f"已清除本地提取排重缓存 {removed} 条")
+        self.extract_status.setText(f"已清除本地排重缓存：{removed} 条。")
+        self.refresh_logs()
+        QMessageBox.information(self, "清除完成", f"已清除本地提取排重缓存 {removed} 条。")
 
     def extract_finished(self, result: dict[str, int]) -> None:
         message = f"提取已结束：已写入 {result['written']} 行；排除重复 {result['duplicates']} 行；无效日期 {result['invalid_dates']} 行。"
