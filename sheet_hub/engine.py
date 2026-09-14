@@ -494,6 +494,8 @@ class DataEngine:
                 output_sheet_name,
                 headers,
                 self.store.get("field_aliases", {}),
+                self._signature_header(),
+                self._signature_value(),
             )
             destination_label = str(destination)
         self.store.mark_extracted([key for _, key in selected], destination_label)
@@ -519,10 +521,20 @@ class DataEngine:
         headers, _ = self._export_rows(records)
         return headers
 
+    def _signature_header(self) -> str:
+        if not self.store.get("extract_signature_enabled", False):
+            return ""
+        return str(self.store.get("extract_signature_header", "签字") or "签字").strip()
+
+    def _signature_value(self) -> str:
+        if not self.store.get("extract_signature_enabled", False):
+            return ""
+        return str(self.store.get("extract_signature_value", "") or "").strip()
+
     def _signature_headers(self, headers: list[str]) -> list[str]:
         if not self.store.get("extract_signature_enabled", False):
             return headers
-        signature = str(self.store.get("extract_signature_header", "签字") or "签字").strip()
+        signature = self._signature_header()
         if not signature:
             return headers
         result = list(headers)
@@ -579,11 +591,17 @@ class DataEngine:
         records: list[Record],
         headers: list[str],
         aliases: dict[str, list[str]],
+        signature_header: str = "",
+        signature_value: str = "",
     ) -> list[list[object]]:
+        signature_folded = str(signature_header or "").strip().casefold()
         rows: list[list[object]] = []
         for record in records:
             row: list[object] = []
             for header in headers:
+                if signature_folded and str(header).strip().casefold() == signature_folded:
+                    row.append(signature_value)
+                    continue
                 canonical = cls._canonical_header(header, aliases)
                 if canonical == "来源":
                     row.append(record.sheet_name)
@@ -621,6 +639,8 @@ class DataEngine:
         sheet_name: str = "提取结果",
         headers: list[str] | None = None,
         aliases: dict[str, list[str]] | None = None,
+        signature_header: str = "",
+        signature_value: str = "",
     ) -> None:
         workbook = openpyxl.Workbook()
         sheet = workbook.active
@@ -628,7 +648,13 @@ class DataEngine:
         sheet.title = safe_name or "提取结果"
         export_headers, default_rows = cls._export_rows(records)
         headers = headers or export_headers
-        rows = cls._rows_for_headers(records, headers, aliases or {}) if headers != export_headers or aliases else default_rows
+        rows = cls._rows_for_headers(
+            records,
+            headers,
+            aliases or {},
+            signature_header,
+            signature_value,
+        ) if headers != export_headers or aliases or signature_header else default_rows
         sheet.append(headers)
         for row in rows:
             sheet.append(row)
@@ -708,18 +734,58 @@ class DataEngine:
             while existing_header and not str(existing_header[-1]).strip():
                 existing_header.pop()
         headers = existing_header or required_headers
-        rows = self._rows_for_headers(records, headers, aliases)
+        headers = self._signature_headers(headers) if existing_header else headers
+        rows = self._rows_for_headers(records, headers, aliases, self._signature_header(), self._signature_value())
         payload = ([headers] if not existing_header else []) + rows
         if not payload:
             return
         escaped_name = target_name.replace("'", "''")
+        if existing_header:
+            if rows:
+                sheet_id = next(
+                    item["properties"]["sheetId"]
+                    for item in metadata.get("sheets", [])
+                    if item["properties"]["title"] == target_name
+                )
+                google_retry(
+                    lambda: http.batch_update(
+                        sid,
+                        {
+                            "requests": [{
+                                "insertDimension": {
+                                    "range": {
+                                        "sheetId": sheet_id,
+                                        "dimension": "ROWS",
+                                        "startIndex": 1,
+                                        "endIndex": 1 + len(rows),
+                                    },
+                                    "inheritFromBefore": False,
+                                }
+                            }]
+                        },
+                    ),
+                    logger,
+                )
+            for start in range(0, len(rows), 5000):
+                chunk = rows[start:start + 5000]
+                google_retry(
+                    lambda chunk=chunk, start=start: http.values_update(
+                        sid,
+                        f"'{escaped_name}'!A{2 + start}",
+                        params={"valueInputOption": "RAW"},
+                        body={"majorDimension": "ROWS", "values": chunk},
+                    ),
+                    logger,
+                )
+                self._log(operation, "INFO", f"已插入 Google 工作表“{target_name}”第 2 行：{min(start + len(chunk), len(rows))}/{len(rows)} 行")
+            return
         for start in range(0, len(payload), 5000):
             chunk = payload[start:start + 5000]
             google_retry(
-                lambda chunk=chunk: http.values_append(
+                lambda chunk=chunk, start=start: http.values_update(
                     sid,
-                    f"'{escaped_name}'!A1",
-                    params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+                    f"'{escaped_name}'!A{1 + start}",
+                    params={"valueInputOption": "RAW"},
                     body={"majorDimension": "ROWS", "values": chunk},
                 ),
                 logger,

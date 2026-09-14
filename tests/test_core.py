@@ -318,6 +318,7 @@ class DatabaseTests(unittest.TestCase):
             store = ConfigStore(root / "config")
             store.set("extract_signature_enabled", True)
             store.set("extract_signature_header", "签字")
+            store.set("extract_signature_value", "张三")
             store.set("extract_signature_column", "K")
             engine = DataEngine(store)
             output = root / "signature.xlsx"
@@ -336,11 +337,12 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(result["written"], 1)
             workbook = openpyxl.load_workbook(output, read_only=True, data_only=True)
             try:
-                row = next(workbook.active.iter_rows(values_only=True))
+                rows = list(workbook.active.iter_rows(values_only=True))
             finally:
                 workbook.close()
-            self.assertEqual(row[0], "来源")
-            self.assertEqual(row[10], "签字")
+            self.assertEqual(rows[0][0], "来源")
+            self.assertEqual(rows[0][10], "签字")
+            self.assertEqual(rows[1][10], "张三")
 
     def test_extract_output_schema_supports_column_mapping_objects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -579,7 +581,8 @@ class WorkbookTests(unittest.TestCase):
     def test_google_output_appends_header_and_rows(self):
         class FakeHttp:
             def __init__(self):
-                self.appended = []
+                self.inserted = []
+                self.written = []
 
             def fetch_sheet_metadata(self, key, params=None):
                 return {"sheets": [{"properties": {"sheetId": 1, "title": "目标页"}}]}
@@ -587,8 +590,11 @@ class WorkbookTests(unittest.TestCase):
             def values_get(self, key, range_name, params=None):
                 return {"values": []}
 
-            def values_append(self, key, range_name, params=None, body=None):
-                self.appended.extend(body["values"])
+            def batch_update(self, key, body=None):
+                self.inserted.extend(body["requests"])
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.written.extend(body["values"])
 
         http = FakeHttp()
         client = SimpleNamespace(http_client=http)
@@ -604,15 +610,16 @@ class WorkbookTests(unittest.TestCase):
                     records,
                     "测试",
                 )
-        self.assertEqual(http.appended[0], ["来源", "号码"])
-        self.assertEqual(http.appended[1], ["渠道A", "123"])
+        self.assertEqual(http.written[0], ["来源", "号码"])
+        self.assertEqual(http.written[1], ["渠道A", "123"])
 
     def test_google_output_uses_existing_alias_header_order(self):
         existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期"]
 
         class FakeHttp:
             def __init__(self):
-                self.appended = []
+                self.inserted = []
+                self.written = []
 
             def fetch_sheet_metadata(self, key, params=None):
                 return {"sheets": [{"properties": {"sheetId": 1, "title": "测试"}}]}
@@ -620,8 +627,11 @@ class WorkbookTests(unittest.TestCase):
             def values_get(self, key, range_name, params=None):
                 return {"values": [existing]}
 
-            def values_append(self, key, range_name, params=None, body=None):
-                self.appended.extend(body["values"])
+            def batch_update(self, key, body=None):
+                self.inserted.extend(body["requests"])
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.written.extend(body["values"])
 
         http = FakeHttp()
         client = SimpleNamespace(http_client=http)
@@ -647,7 +657,8 @@ class WorkbookTests(unittest.TestCase):
                     records,
                     "测试",
                 )
-        self.assertEqual(http.appended[0], [
+        self.assertEqual(http.inserted[0]["insertDimension"]["range"]["startIndex"], 1)
+        self.assertEqual(http.written[0], [
             "1008-李薇", "42", "李薇", "A", "12:00", "女", "https://example.test",
             "258851758692", "2026-09-13",
         ])
@@ -657,7 +668,8 @@ class WorkbookTests(unittest.TestCase):
 
         class FakeHttp:
             def __init__(self):
-                self.appended = []
+                self.inserted = []
+                self.written = []
 
             def fetch_sheet_metadata(self, key, params=None):
                 return {"sheets": [{"properties": {"sheetId": 1, "title": "提取表格"}}]}
@@ -665,14 +677,20 @@ class WorkbookTests(unittest.TestCase):
             def values_get(self, key, range_name, params=None):
                 return {"values": [existing]}
 
-            def values_append(self, key, range_name, params=None, body=None):
-                self.appended.extend(body["values"])
+            def batch_update(self, key, body=None):
+                self.inserted.extend(body["requests"])
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.written.extend(body["values"])
 
         http = FakeHttp()
         client = SimpleNamespace(http_client=http)
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
             store.set("credential_path", "fake.json")
+            store.set("extract_signature_enabled", True)
+            store.set("extract_signature_header", "签字")
+            store.set("extract_signature_value", "张三")
             engine = DataEngine(store)
             records = [Record(
                 "s", "源", "g", "1008-李薇", 2,
@@ -690,9 +708,10 @@ class WorkbookTests(unittest.TestCase):
                     "测试",
                     prefer_record_headers=True,
                 )
-        self.assertEqual(http.appended[0], [
+        self.assertEqual(http.inserted[0]["insertDimension"]["range"]["startIndex"], 1)
+        self.assertEqual(http.written[0], [
             "1008-李薇", "42", "李薇", "", "", "", "https://example.test",
-            "258851758692", "2026-09-13", "",
+            "258851758692", "2026-09-13", "张三",
         ])
 
 

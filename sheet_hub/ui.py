@@ -560,6 +560,8 @@ class MainWindow(QMainWindow):
         self.extract_signature_enabled.setChecked(bool(self.store.get("extract_signature_enabled", False)))
         self.extract_signature_header = QLineEdit(str(self.store.get("extract_signature_header", "签字") or "签字"))
         self.extract_signature_header.setPlaceholderText("例如：签字")
+        self.extract_signature_value = QLineEdit(str(self.store.get("extract_signature_value", "") or ""))
+        self.extract_signature_value.setPlaceholderText("提取人姓名")
         self.extract_signature_column = QComboBox()
         self.extract_signature_column.setEditable(True)
         self.extract_signature_column.setInsertPolicy(QComboBox.NoInsert)
@@ -569,6 +571,8 @@ class MainWindow(QMainWindow):
         signature_row.addWidget(self.extract_signature_enabled)
         signature_row.addWidget(QLabel("表头"))
         signature_row.addWidget(self.extract_signature_header)
+        signature_row.addWidget(QLabel("内容"))
+        signature_row.addWidget(self.extract_signature_value)
         signature_row.addWidget(QLabel("列"))
         signature_row.addWidget(self.extract_signature_column)
         self.extract_mode = QComboBox()
@@ -616,6 +620,7 @@ class MainWindow(QMainWindow):
         self.dedup_fields.editingFinished.connect(self.persist_workspace_settings)
         self.extract_signature_enabled.toggled.connect(self.persist_workspace_settings)
         self.extract_signature_header.editingFinished.connect(self.persist_workspace_settings)
+        self.extract_signature_value.editingFinished.connect(self.persist_workspace_settings)
         self.extract_signature_column.currentTextChanged.connect(self.persist_workspace_settings)
         self.google_output_url.editingFinished.connect(self.persist_workspace_settings)
         self.output_sheet_name.editingFinished.connect(self.persist_workspace_settings)
@@ -842,6 +847,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "extract_signature_enabled"):
                 self.store.set("extract_signature_enabled", self.extract_signature_enabled.isChecked())
                 self.store.set("extract_signature_header", self.extract_signature_header.text().strip() or "签字")
+                self.store.set("extract_signature_value", self.extract_signature_value.text().strip())
                 self.store.set("extract_signature_column", self.extract_signature_column.currentText().strip().upper())
             date_field = self.extract_date_field.currentText().strip()
             if date_field:

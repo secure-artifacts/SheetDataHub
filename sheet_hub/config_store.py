@@ -101,6 +101,7 @@ class ConfigStore:
             "extract_date_field": "日期",
             "extract_signature_enabled": False,
             "extract_signature_header": "签字",
+            "extract_signature_value": "",
             "extract_signature_column": "",
             "extract_column_schema_enabled": False,
             "extract_column_schema": [],
