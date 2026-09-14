@@ -394,13 +394,27 @@ class DataEngine:
         canonical = self._field_kind(field)
         results: list[tuple[str, Record | None]] = []
         matched_inputs = 0
+        indexed_records: list[tuple[Record, list[str]]] = []
+        exact_index: dict[str, list[Record]] = {}
+        for record in records:
+            haystacks = [
+                self._match_value(canonical, value)
+                for value in self._query_values(record, field)
+            ]
+            haystacks = self._unique_headers([value for value in haystacks if value])
+            indexed_records.append((record, haystacks))
+            if exact:
+                for haystack in haystacks:
+                    exact_index.setdefault(haystack, []).append(record)
         for query_value in queries:
             needle = self._match_value(canonical, query_value)
-            matches = []
-            for record in records:
-                haystacks = [self._match_value(canonical, value) for value in self._query_values(record, field)]
-                if any((haystack == needle) if exact else (needle in haystack) for haystack in haystacks):
-                    matches.append(record)
+            if exact:
+                matches = exact_index.get(needle, [])
+            else:
+                matches = [
+                    record for record, haystacks in indexed_records
+                    if any(needle in haystack for haystack in haystacks)
+                ]
             if matches:
                 matched_inputs += 1
                 results.extend((query_value, record) for record in matches)

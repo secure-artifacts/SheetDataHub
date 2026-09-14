@@ -233,6 +233,29 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(results[0][1].sheet_name, "1008-李薇")
             self.assertIsNone(results[1][1])
 
+    def test_batch_query_exact_uses_index_and_keeps_all_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "A", 2, {"号码": "258-851-758692"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"手机号码": "258851758692"}, "h2"),
+                Record("s", "源", "g", "C", 4, {"号码": "999"}, "h3"),
+            ])
+            results = engine.query_many("号码", ["258851758692", "000"], exact=True)
+            self.assertEqual([record.sheet_name if record else None for _, record in results], ["A", "B", None])
+
+    def test_batch_query_fuzzy_reuses_prepared_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "1008-李薇", 2, {"号码": "123"}, "h1"),
+                Record("s", "源", "g", "AAOZ-依心", 3, {"号码": "456"}, "h2"),
+            ])
+            results = engine.query_many("来源", ["李薇", "依心"], exact=False)
+            self.assertEqual([record.sheet_name for _, record in results if record], ["1008-李薇", "AAOZ-依心"])
+
     def test_fuzzy_source_query_matches_original_and_corrected_sheet_name(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
