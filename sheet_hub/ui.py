@@ -737,6 +737,15 @@ class MainWindow(QMainWindow):
         version_row.addWidget(self.update_button)
         version_row.addStretch()
         form.addRow("软件版本", version_row)
+        config_row = QHBoxLayout()
+        export_config = QPushButton("导出配置")
+        import_config = QPushButton("导入配置")
+        export_config.clicked.connect(self.export_config_file)
+        import_config.clicked.connect(self.import_config_file)
+        config_row.addWidget(export_config)
+        config_row.addWidget(import_config)
+        config_row.addStretch()
+        form.addRow("配置迁移", config_row)
         layout.addWidget(card)
         layout.addWidget(save, 0, Qt.AlignLeft)
         layout.addStretch()
@@ -1230,22 +1239,10 @@ class MainWindow(QMainWindow):
             self.fields_table.removeRow(self.fields_table.currentRow())
 
     def save_fields(self) -> None:
-        aliases: dict[str, list[str]] = {}
-        for row in range(self.fields_table.rowCount()):
-            field_item = self.fields_table.item(row, 0)
-            names_item = self.fields_table.item(row, 1)
-            field = field_item.text().strip() if field_item else ""
-            if field:
-                aliases[field] = split_names(names_item.text() if names_item else "")
-        if not aliases:
-            QMessageBox.warning(self, "不能保存", "至少保留一个标准字段。")
+        if not self.save_fields_to_store():
             return
-        schema = self.schema_editor.schema()
-        self.store.set("field_aliases", aliases)
-        self.store.set("column_schema_enabled", self.schema_enabled.isChecked())
-        self.store.set("column_schema", schema)
         self.refresh_field_controls()
-        QMessageBox.information(self, "已保存", f"字段分配已经保存，共 {len(schema_field_names(schema))} 个启用字段。")
+        QMessageBox.information(self, "已保存", f"字段分配已经保存，共 {len(schema_field_names(self.schema_editor.schema()))} 个启用字段。")
 
     def refresh_field_controls(self) -> None:
         aliases = self.store.get("field_aliases", {})
@@ -1405,6 +1402,120 @@ class MainWindow(QMainWindow):
         self.store.set("global_excludes", split_names(self.global_excludes.toPlainText()))
         self.store.set("credential_path", self.default_credential.text().strip())
         QMessageBox.information(self, "已保存", "设置已经保存。")
+
+    def export_config_file(self) -> None:
+        self.persist_workspace_settings()
+        self.save_fields_to_store(silent=True)
+        default_path = str(Path.home() / "Desktop" / "表数通配置.json")
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置", default_path, "JSON 配置文件 (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        payload = self.store.export_config()
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.store.log("INFO", "配置迁移", f"已导出配置：{path}")
+        self.refresh_logs()
+        QMessageBox.information(self, "导出完成", f"配置已导出：\n{path}")
+
+    def import_config_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "导入配置", "", "JSON 配置文件 (*.json)")
+        if not path:
+            return
+        answer = QMessageBox.question(
+            self,
+            "导入配置",
+            "导入后会覆盖当前数据源、字段映射、列配置、查询和提取设置。\n\n"
+            "不会删除本地排重缓存、运行日志或汇总数据库。确定继续吗？",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            settings_count, source_count = self.store.import_config(payload)
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        self.store.log("INFO", "配置迁移", f"已导入配置：{path}，设置 {settings_count} 项，数据源 {source_count} 个")
+        self.apply_store_to_ui()
+        self.refresh_logs()
+        QMessageBox.information(
+            self,
+            "导入完成",
+            f"已导入配置：{source_count} 个数据源，{settings_count} 项设置。\n"
+            "如果服务账号 JSON 路径在这台电脑不存在，请到设置里重新选择。",
+        )
+
+    def save_fields_to_store(self, silent: bool = False) -> bool:
+        if not hasattr(self, "fields_table"):
+            return True
+        aliases: dict[str, list[str]] = {}
+        for row in range(self.fields_table.rowCount()):
+            field_item = self.fields_table.item(row, 0)
+            names_item = self.fields_table.item(row, 1)
+            field = field_item.text().strip() if field_item else ""
+            if not field:
+                continue
+            aliases[field] = split_names(names_item.text() if names_item else "")
+        if not aliases:
+            if not silent:
+                QMessageBox.warning(self, "不能保存", "至少保留一个标准字段。")
+            return False
+        schema = self.schema_editor.schema()
+        self.store.set("field_aliases", aliases)
+        self.store.set("column_schema_enabled", self.schema_enabled.isChecked())
+        self.store.set("column_schema", schema)
+        return True
+
+    def apply_store_to_ui(self) -> None:
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        try:
+            if hasattr(self, "global_excludes"):
+                self.global_excludes.setPlainText("\n".join(self.store.get("global_excludes", [])))
+                self.default_credential.setText(str(self.store.get("credential_path", "") or ""))
+            if hasattr(self, "query_mode"):
+                saved_source = str(self.store.get("query_source", "extract") or "extract")
+                if saved_source in QUERY_SOURCES:
+                    self.query_mode.setCurrentIndex(QUERY_SOURCES.index(saved_source))
+                self.query_fuzzy.setChecked(bool(self.store.get("query_fuzzy", False)))
+                self.query_date_enabled.setChecked(bool(self.store.get("query_date_enabled", False)))
+                for widget, key in (
+                    (self.query_start_date, "query_start_date"),
+                    (self.query_end_date, "query_end_date"),
+                ):
+                    saved = QDate.fromString(str(self.store.get(key, "") or ""), "yyyy-MM-dd")
+                    if saved.isValid():
+                        widget.setDate(saved)
+            if hasattr(self, "output_type"):
+                saved_type = str(self.store.get("extract_destination_type", "local") or "local")
+                self.output_type.setCurrentIndex(1 if saved_type == "google" else 0)
+                self.google_output_url.setText(str(self.store.get("google_output_url", "") or ""))
+                self.output_sheet_name.setText(str(self.store.get("google_output_sheet", "提取结果") or "提取结果"))
+                self.output_path.setText(str(self.store.get("extract_output_path", "") or ""))
+                self.extract_mode.setCurrentIndex(1 if str(self.store.get("extract_mode", "aggregate")) == "direct" else 0)
+                self.dedup_fields.setText(str(self.store.get("extract_dedup_fields", "号码,日期") or "号码,日期"))
+                self.extract_signature_enabled.setChecked(bool(self.store.get("extract_signature_enabled", False)))
+                self.extract_signature_header.setText(str(self.store.get("extract_signature_header", "签字") or "签字"))
+                self.extract_signature_value.setText(str(self.store.get("extract_signature_value", "") or ""))
+                self.extract_signature_column.setCurrentText(str(self.store.get("extract_signature_column", "") or ""))
+                self.extract_schema_enabled.setChecked(bool(self.store.get("extract_column_schema_enabled", False)))
+                self.extract_schema_editor.set_schema(self.store.get("extract_column_schema", []) or [])
+                self.extract_schema_editor.setEnabled(self.extract_schema_enabled.isChecked())
+            if hasattr(self, "schema_enabled"):
+                self.schema_enabled.setChecked(bool(self.store.get("column_schema_enabled", False)))
+                self.schema_editor.set_schema(self.store.get("column_schema", []) or [])
+                self.update_schema_enabled(self.schema_enabled.isChecked())
+                self.load_fields_table()
+            self.refresh_sources()
+            self.refresh_extract_source_picker()
+            self.refresh_query_source_picker()
+            self.update_output_destination()
+            self.update_extract_source_visibility()
+            self.update_query_date_controls()
+            self.refresh_field_controls()
+        finally:
+            self._restoring_settings = restoring
 
     def run_task(
         self,

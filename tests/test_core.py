@@ -167,6 +167,37 @@ class DatabaseTests(unittest.TestCase):
             self.assertFalse(store.was_extracted("k1"))
             self.assertEqual(len(store.read_logs()), 1)
 
+    def test_export_import_config_moves_sources_and_settings_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_store = ConfigStore(root / "source")
+            source_store.set("global_excludes", ["不要跑"])
+            source_store.set("extract_dedup_fields", "号码,日期")
+            source_store.set("column_schema_enabled", True)
+            source_store.set("column_schema", [{"name": "手机号码", "column": "H", "enabled": True}])
+            source_store.save_source(SourceConfig(
+                "s1", "主表", "https://docs.google.com/spreadsheets/d/abc",
+                include_sheets=["订单"], exclude_sheets=["统计"], header_row=1,
+                column_schema_enabled=True,
+                column_schema=[{"name": "日期", "column": "I", "enabled": True}],
+            ))
+            source_store.mark_extracted(["old"], "目标")
+            payload = source_store.export_config()
+
+            target_store = ConfigStore(root / "target")
+            target_store.mark_extracted(["keep"], "目标")
+            settings_count, source_count = target_store.import_config(payload)
+
+            self.assertGreater(settings_count, 0)
+            self.assertEqual(source_count, 1)
+            self.assertEqual(target_store.get("global_excludes"), ["不要跑"])
+            self.assertEqual(target_store.get("column_schema")[0]["name"], "手机号码")
+            imported_source = target_store.load_sources()[0]
+            self.assertEqual(imported_source.name, "主表")
+            self.assertEqual(imported_source.include_sheets, ["订单"])
+            self.assertFalse(target_store.was_extracted("old"))
+            self.assertTrue(target_store.was_extracted("keep"))
+
     def test_sharding_and_query(self):
         with tempfile.TemporaryDirectory() as directory:
             db = AggregateDatabase(directory, 1000)

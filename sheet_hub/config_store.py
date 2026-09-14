@@ -4,10 +4,12 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
 from .models import SourceConfig
+from .version import APP_VERSION
 
 
 APP_NAME = "SheetDataHub"
@@ -18,6 +20,8 @@ DEFAULT_FIELDS = {
     "来源": ["来源", "渠道", "平台", "source"],
     "号码": ["号码", "手机号", "手机号码", "电话", "联系电话", "phone", "number"],
 }
+
+CONFIG_EXPORT_FORMAT = "SheetDataHubConfig"
 
 
 def default_data_dir() -> Path:
@@ -136,6 +140,17 @@ class ConfigStore:
                 (key, encoded),
             )
 
+    def all_settings(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key,value FROM settings ORDER BY key").fetchall()
+        result: dict[str, Any] = {}
+        for row in rows:
+            try:
+                result[str(row["key"])] = json.loads(row["value"])
+            except json.JSONDecodeError:
+                result[str(row["key"])] = row["value"]
+        return result
+
     def load_sources(self) -> list[SourceConfig]:
         with self._connect() as conn:
             rows = conn.execute("SELECT data FROM sources ORDER BY rowid").fetchall()
@@ -152,6 +167,49 @@ class ConfigStore:
     def delete_source(self, source_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
+
+    def replace_sources(self, sources: list[SourceConfig]) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sources")
+            conn.executemany(
+                "INSERT INTO sources(id,data) VALUES(?,?)",
+                [(source.id, json.dumps(source.to_dict(), ensure_ascii=False)) for source in sources],
+            )
+
+    def export_config(self) -> dict[str, Any]:
+        return {
+            "format": CONFIG_EXPORT_FORMAT,
+            "version": 1,
+            "app_version": APP_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "settings": self.all_settings(),
+            "sources": [source.to_dict() for source in self.load_sources()],
+        }
+
+    def import_config(self, payload: dict[str, Any]) -> tuple[int, int]:
+        if not isinstance(payload, dict) or payload.get("format") != CONFIG_EXPORT_FORMAT:
+            raise ValueError("这不是有效的表数通配置文件。")
+        settings = payload.get("settings")
+        sources = payload.get("sources")
+        if not isinstance(settings, dict) or not isinstance(sources, list):
+            raise ValueError("配置文件内容不完整。")
+        source_items = [SourceConfig.from_dict(item) for item in sources if isinstance(item, dict)]
+        with self._connect() as conn:
+            for key, value in settings.items():
+                if not isinstance(key, str) or key in {"app_version"}:
+                    continue
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, json.dumps(value, ensure_ascii=False)),
+                )
+            conn.execute("DELETE FROM sources")
+            conn.executemany(
+                "INSERT INTO sources(id,data) VALUES(?,?)",
+                [(source.id, json.dumps(source.to_dict(), ensure_ascii=False)) for source in source_items],
+            )
+        return len(settings), len(source_items)
+
 
     def log(self, level: str, operation: str, message: str, detail: str = "") -> None:
         with self._connect() as conn:
