@@ -56,6 +56,19 @@ from .version import APP_VERSION, download_release_installer, fetch_latest_relea
 APP_TITLE = "表数通"
 QUERY_SOURCES = ["extract", "aggregate", "direct"]
 COLUMN_LETTERS = [excel_column(index) for index in range(52)]
+DEFAULT_QUERY_RESULT_FIELDS = ["输入电话号码", "专页ID", "姓名", "评论贴文", "号码", "日期", "修正格式"]
+
+
+def query_result_headers(
+    store: ConfigStore,
+    source: str,
+    query_field: str,
+    result_fields: list[str],
+) -> list[str]:
+    engine = DataEngine(store)
+    if source == "extract" or engine._field_kind(query_field).casefold() == "号码":
+        return DEFAULT_QUERY_RESULT_FIELDS.copy()
+    return result_fields or [query_field]
 
 
 class ColumnMapRow(QFrame):
@@ -938,9 +951,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少提取表", "请先在「时间提取」页填写目标 Google 表格链接或本地输出文件。")
             return
         self.persist_workspace_settings()
-        result_fields = engine.list_query_fields(source, extract_target, extract_sheet, source_id)
-        if not result_fields:
-            result_fields = [field]
+        result_fields = query_result_headers(
+            self.store,
+            source,
+            field,
+            engine.list_query_fields(source, extract_target, extract_sheet, source_id),
+        )
         if hasattr(self, "query_result_summary"):
             self.query_result_summary.setText(f"正在查询：输入 {len(values)} 个值…")
         self.run_task(
@@ -970,7 +986,12 @@ class MainWindow(QMainWindow):
         fields: list[str] | None = None,
         query_field: str = "号码",
     ) -> None:
-        fields = fields or [query_field]
+        if not fields:
+            engine = DataEngine(self.store)
+            if engine._field_kind(query_field).casefold() == "号码":
+                fields = DEFAULT_QUERY_RESULT_FIELDS.copy()
+            else:
+                fields = [query_field]
         self.query_table.setColumnCount(len(fields))
         self.query_table.setHorizontalHeaderLabels(fields)
         self.query_table.setRowCount(len(results))
@@ -982,14 +1003,20 @@ class MainWindow(QMainWindow):
             if record is None:
                 values = ["" for _ in fields]
                 for column, header_name in enumerate(fields):
-                    if engine._canonical_field(header_name).casefold() == query_canonical:
+                    if header_name.strip() in {"输入电话号码", "输入电话", "查询值"}:
+                        values[column] = query_value
+                    elif engine._canonical_field(header_name).casefold() == query_canonical:
                         values[column] = query_value
                         break
                 phone = query_value if query_canonical == "号码" else ""
                 corrected = "未找到"
             else:
                 found += 1
-                values = [engine.query_display_value(record, header_name) for header_name in fields]
+                values = [
+                    query_value if header_name.strip() in {"输入电话号码", "输入电话", "查询值"}
+                    else engine.query_display_value(record, header_name)
+                    for header_name in fields
+                ]
                 phone = engine._field_value(record, "号码") or (query_value if query_canonical == "号码" else "")
                 corrected = self.corrected_source(record.sheet_name)
             self.query_copy_rows.append((str(phone), str(corrected)))

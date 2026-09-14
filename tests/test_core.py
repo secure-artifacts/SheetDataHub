@@ -14,6 +14,7 @@ from sheet_hub.database import AggregateDatabase
 from sheet_hub.engine import DataEngine, parse_date
 from sheet_hub.models import Record, SourceConfig
 from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry, parse_schema_lines
+from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, query_result_headers
 from sheet_hub.version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer, parse_version
 
 
@@ -135,6 +136,23 @@ class RuleTests(unittest.TestCase):
             self.assertTrue(reopened.get("query_exact"))
             self.assertFalse(reopened.get("query_fuzzy"))
             self.assertFalse(reopened.get("query_date_enabled"))
+
+    def test_query_result_headers_keep_phone_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(directory)
+            source_headers = ["预交表汇总", "见证状态", "交教会日期", "摸底/推广", "线索电话号码"]
+            self.assertEqual(
+                query_result_headers(store, "extract", "摸底/推广", source_headers),
+                DEFAULT_QUERY_RESULT_FIELDS,
+            )
+            self.assertEqual(
+                query_result_headers(store, "direct", "线索电话号码", source_headers),
+                DEFAULT_QUERY_RESULT_FIELDS,
+            )
+            self.assertEqual(
+                query_result_headers(store, "direct", "摸底/推广", source_headers),
+                source_headers,
+            )
 
 
 class DatabaseTests(unittest.TestCase):
