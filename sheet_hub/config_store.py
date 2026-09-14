@@ -96,6 +96,7 @@ class ConfigStore:
             "query_start_date": "",
             "query_end_date": "",
             "extract_mode": "aggregate",
+            "extract_direct_source_id": "",
             "extract_dedup_fields": "号码,日期",
             "extract_date_field": "日期",
             "extract_column_schema_enabled": False,

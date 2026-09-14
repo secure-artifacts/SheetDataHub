@@ -559,6 +559,10 @@ class MainWindow(QMainWindow):
         self.extract_mode = QComboBox()
         self.extract_mode.addItems(["从汇总数据库提取", "直接从数据源提取"])
         self.extract_mode.setCurrentIndex(1 if str(self.store.get("extract_mode", "aggregate")) == "direct" else 0)
+        self.extract_source_label = QLabel("指定数据源")
+        self.extract_source_pick = QComboBox()
+        self.extract_source_pick.setMinimumWidth(220)
+        self.extract_source_pick.currentIndexChanged.connect(self.on_extract_source_changed)
         self.output_type = QComboBox()
         self.output_type.addItems(["本地 Excel 文件", "Google 表格链接"])
         saved_type = str(self.store.get("extract_destination_type", "local"))
@@ -578,6 +582,7 @@ class MainWindow(QMainWindow):
         form.addRow("日期范围", date_row)
         form.addRow("去重字段", self.dedup_fields)
         form.addRow("数据来源", self.extract_mode)
+        form.addRow(self.extract_source_label, self.extract_source_pick)
         form.addRow("输出目标", self.output_type)
         form.addRow("目标表格链接", self.google_output_url)
         form.addRow("目标工作表", self.output_sheet_name)
@@ -598,6 +603,8 @@ class MainWindow(QMainWindow):
         self.output_path.editingFinished.connect(self.persist_workspace_settings)
         self.extract_schema_enabled.toggled.connect(self.persist_workspace_settings)
         self.local_output_widgets = [self.output_path, choose]
+        self.refresh_extract_source_picker()
+        self.update_extract_source_visibility()
         self.update_output_destination()
         button = QPushButton("开始提取")
         button.setObjectName("primary")
@@ -726,6 +733,7 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values):
                 self.source_table.setItem(row, column, QTableWidgetItem(value))
         self.refresh_query_source_picker()
+        self.refresh_extract_source_picker()
         if not getattr(self, "_restoring_settings", False):
             self.refresh_query_fields()
 
@@ -809,6 +817,8 @@ class MainWindow(QMainWindow):
             self.store.set("google_output_sheet", self.output_sheet_name.text().strip() or "提取结果")
             self.store.set("extract_output_path", self.output_path.text().strip())
             self.store.set("extract_mode", "direct" if self.extract_mode.currentIndex() == 1 else "aggregate")
+            if hasattr(self, "extract_source_pick"):
+                self.store.set("extract_direct_source_id", self.extract_source_pick.currentData() or "")
             self.store.set("extract_dedup_fields", self.dedup_fields.text().strip() or "号码,日期")
             date_field = self.extract_date_field.currentText().strip()
             if date_field:
@@ -860,6 +870,37 @@ class MainWindow(QMainWindow):
         direct = self.current_query_mode() == "direct"
         self.query_table_label.setVisible(direct)
         self.query_source_pick.setVisible(direct)
+
+    def current_extract_source_id(self) -> str:
+        if not hasattr(self, "extract_source_pick"):
+            return ""
+        if not hasattr(self, "extract_mode") or self.extract_mode.currentIndex() != 1:
+            return ""
+        return str(self.extract_source_pick.currentData() or "")
+
+    def update_extract_source_visibility(self) -> None:
+        if not hasattr(self, "extract_source_pick"):
+            return
+        direct = self.extract_mode.currentIndex() == 1
+        self.extract_source_label.setVisible(direct)
+        self.extract_source_pick.setVisible(direct)
+
+    def refresh_extract_source_picker(self) -> None:
+        if not hasattr(self, "extract_source_pick"):
+            return
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        saved = str(self.store.get("extract_direct_source_id", "") or "")
+        current = self.extract_source_pick.currentData()
+        self.extract_source_pick.clear()
+        self.extract_source_pick.addItem("全部数据源", "")
+        for source in self.store.load_sources():
+            if source.enabled:
+                self.extract_source_pick.addItem(source.name, source.id)
+        target = current if current not in (None, "") else saved
+        index = self.extract_source_pick.findData(target)
+        self.extract_source_pick.setCurrentIndex(index if index >= 0 else 0)
+        self._restoring_settings = restoring
 
     def update_query_date_controls(self) -> None:
         enabled = self.query_date_enabled.isChecked()
@@ -1079,6 +1120,7 @@ class MainWindow(QMainWindow):
         fields = split_names(self.dedup_fields.text())
         date_field = self.extract_date_field.currentText()
         direct = self.extract_mode.currentIndex() == 1
+        source_id = self.current_extract_source_id()
         sheet_name = self.output_sheet_name.text().strip() or "提取结果"
         self.store.set("google_output_url", google_url)
         self.store.set("google_output_sheet", sheet_name)
@@ -1088,7 +1130,7 @@ class MainWindow(QMainWindow):
         self.run_task(
             lambda: engine.extract(
                 date_field, start, end, output, fields, direct, sheet_name,
-                "google" if google_mode else "local", google_url,
+                "google" if google_mode else "local", google_url, source_id,
             ),
             self.extract_finished,
             "正在按时间提取…",
@@ -1148,7 +1190,8 @@ class MainWindow(QMainWindow):
     def refresh_field_controls(self) -> None:
         aliases = self.store.get("field_aliases", {})
         mode = "direct" if hasattr(self, "extract_mode") and self.extract_mode.currentIndex() == 1 else "aggregate"
-        fields = DataEngine(self.store).list_query_fields(mode) or list(aliases.keys())
+        source_id = self.current_extract_source_id() if mode == "direct" else ""
+        fields = DataEngine(self.store).list_query_fields(mode, source_id=source_id) or list(aliases.keys())
         restoring = self._restoring_settings
         self._restoring_settings = True
         current_date = self.extract_date_field.currentText() if hasattr(self, "extract_date_field") else ""
@@ -1166,6 +1209,13 @@ class MainWindow(QMainWindow):
         self.refresh_query_fields()
 
     def on_extract_mode_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.update_extract_source_visibility()
+        self.refresh_field_controls()
+        self.persist_workspace_settings()
+
+    def on_extract_source_changed(self) -> None:
         if getattr(self, "_restoring_settings", False):
             return
         self.refresh_field_controls()

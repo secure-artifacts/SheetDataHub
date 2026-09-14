@@ -277,6 +277,41 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(first["written"], 1)
             self.assertEqual(second["duplicates"], 1)
 
+    def test_direct_extract_can_limit_source_and_adds_source_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ConfigStore(root / "config")
+            store.set("column_schema_enabled", True)
+            store.set("column_schema", ["专页ID", "号码"])
+            engine = DataEngine(store)
+            records = [
+                Record(
+                    "src2", "源二", "g", "浇灌数据库-过滤", 2,
+                    {
+                        "交教会日期": "2026-09-13",
+                        "线索电话号码": "258851758692",
+                        "摸底/推广": "简单",
+                    },
+                    "h1",
+                )
+            ]
+            output = root / "direct_extract.xlsx"
+            with patch.object(engine, "read_sources", return_value=records) as read_sources:
+                result = engine.extract(
+                    "日期", date(2026, 9, 1), date(2026, 9, 30),
+                    output, ["号码", "日期"], direct=True, source_id="src2",
+                )
+            read_sources.assert_called_once_with("时间提取", "src2")
+            self.assertEqual(result["written"], 1)
+            workbook = openpyxl.load_workbook(output, read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                rows = list(sheet.iter_rows(values_only=True))
+            finally:
+                workbook.close()
+            self.assertEqual(rows[0], ("来源", "交教会日期", "线索电话号码", "摸底/推广"))
+            self.assertEqual(rows[1], ("浇灌数据库-过滤", "2026-09-13", "258851758692", "简单"))
+
     def test_extract_output_schema_supports_column_mapping_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")

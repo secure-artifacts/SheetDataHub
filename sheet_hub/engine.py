@@ -441,11 +441,12 @@ class DataEngine:
         output_sheet_name: str = "提取结果",
         destination_type: str = "local",
         google_output_url: str = "",
+        source_id: str = "",
     ) -> dict[str, int]:
         operation = "时间提取"
         if start > end:
             raise ValueError("开始日期不能晚于结束日期")
-        records = self.read_sources(operation) if direct else self.database.all_records()
+        records = self.read_sources(operation, source_id) if direct else self.database.all_records()
         selected: list[tuple[Record, str]] = []
         skipped_invalid = 0
         skipped_duplicate = 0
@@ -473,12 +474,18 @@ class DataEngine:
         if destination_type == "google":
             if not google_output_url.strip():
                 raise ValueError("请填写目标 Google 表格链接")
-            self._write_google_sheet(google_output_url, output_sheet_name, selected_records, operation)
+            self._write_google_sheet(
+                google_output_url,
+                output_sheet_name,
+                selected_records,
+                operation,
+                prefer_record_headers=direct,
+            )
             destination_label = f"{google_output_url}#{output_sheet_name}"
         else:
             destination = Path(output)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            headers = self._preferred_export_headers(selected_records)
+            headers = self._preferred_export_headers(selected_records, prefer_record_headers=direct)
             self._write_xlsx(
                 destination,
                 selected_records,
@@ -495,11 +502,14 @@ class DataEngine:
         )
         return {"written": len(selected), "duplicates": skipped_duplicate, "invalid_dates": skipped_invalid}
 
-    def _preferred_export_headers(self, records: list[Record]) -> list[str]:
+    def _preferred_export_headers(self, records: list[Record], prefer_record_headers: bool = False) -> list[str]:
         if self.store.get("extract_column_schema_enabled", False):
             configured = schema_field_names(self.store.get("extract_column_schema", []))
             if configured:
                 return ["来源", *[name for name in configured if name != "来源"]]
+        if prefer_record_headers:
+            headers, _ = self._export_rows(records)
+            return headers
         if self.store.get("column_schema_enabled", False):
             configured = schema_field_names(self.store.get("column_schema", []))
             if configured:
@@ -606,7 +616,14 @@ class DataEngine:
             sheet.column_dimensions[letter].width = width
         workbook.save(path)
 
-    def _write_google_sheet(self, url: str, sheet_name: str, records: list[Record], operation: str) -> None:
+    def _write_google_sheet(
+        self,
+        url: str,
+        sheet_name: str,
+        records: list[Record],
+        operation: str,
+        prefer_record_headers: bool = False,
+    ) -> None:
         sid = spreadsheet_id(url)
         if not sid:
             raise ValueError("无法识别目标 Google 表格链接")
@@ -629,7 +646,7 @@ class DataEngine:
         )
         target_name = sheet_name.strip() or "提取结果"
         aliases = self.store.get("field_aliases", {})
-        required_headers = self._preferred_export_headers(records)
+        required_headers = self._preferred_export_headers(records, prefer_record_headers)
         sheet_names = {item["properties"]["title"] for item in metadata.get("sheets", [])}
         created = target_name not in sheet_names
         if created:
