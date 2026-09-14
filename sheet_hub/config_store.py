@@ -99,6 +99,9 @@ class ConfigStore:
             "extract_direct_source_id": "",
             "extract_dedup_fields": "号码,日期",
             "extract_date_field": "日期",
+            "extract_signature_enabled": False,
+            "extract_signature_header": "签字",
+            "extract_signature_column": "",
             "extract_column_schema_enabled": False,
             "extract_column_schema": [],
         }

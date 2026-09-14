@@ -556,6 +556,21 @@ class MainWindow(QMainWindow):
         date_row.addStretch()
         self.dedup_fields = QLineEdit(str(self.store.get("extract_dedup_fields", "号码,日期") or "号码,日期"))
         self.dedup_fields.setPlaceholderText("多个字段用逗号分隔；留空时使用源位置和行指纹")
+        self.extract_signature_enabled = QCheckBox("添加签字栏")
+        self.extract_signature_enabled.setChecked(bool(self.store.get("extract_signature_enabled", False)))
+        self.extract_signature_header = QLineEdit(str(self.store.get("extract_signature_header", "签字") or "签字"))
+        self.extract_signature_header.setPlaceholderText("例如：签字")
+        self.extract_signature_column = QComboBox()
+        self.extract_signature_column.setEditable(True)
+        self.extract_signature_column.setInsertPolicy(QComboBox.NoInsert)
+        self.extract_signature_column.addItems(["", *COLUMN_LETTERS])
+        self.extract_signature_column.setCurrentText(str(self.store.get("extract_signature_column", "") or ""))
+        signature_row = QHBoxLayout()
+        signature_row.addWidget(self.extract_signature_enabled)
+        signature_row.addWidget(QLabel("表头"))
+        signature_row.addWidget(self.extract_signature_header)
+        signature_row.addWidget(QLabel("列"))
+        signature_row.addWidget(self.extract_signature_column)
         self.extract_mode = QComboBox()
         self.extract_mode.addItems(["从汇总数据库提取", "直接从数据源提取"])
         self.extract_mode.setCurrentIndex(1 if str(self.store.get("extract_mode", "aggregate")) == "direct" else 0)
@@ -581,6 +596,7 @@ class MainWindow(QMainWindow):
         form.addRow("日期字段", self.extract_date_field)
         form.addRow("日期范围", date_row)
         form.addRow("去重字段", self.dedup_fields)
+        form.addRow("签字栏", signature_row)
         form.addRow("数据来源", self.extract_mode)
         form.addRow(self.extract_source_label, self.extract_source_pick)
         form.addRow("输出目标", self.output_type)
@@ -598,6 +614,9 @@ class MainWindow(QMainWindow):
         self.output_type.currentIndexChanged.connect(self.update_output_destination)
         self.extract_mode.currentIndexChanged.connect(self.on_extract_mode_changed)
         self.dedup_fields.editingFinished.connect(self.persist_workspace_settings)
+        self.extract_signature_enabled.toggled.connect(self.persist_workspace_settings)
+        self.extract_signature_header.editingFinished.connect(self.persist_workspace_settings)
+        self.extract_signature_column.currentTextChanged.connect(self.persist_workspace_settings)
         self.google_output_url.editingFinished.connect(self.persist_workspace_settings)
         self.output_sheet_name.editingFinished.connect(self.persist_workspace_settings)
         self.output_path.editingFinished.connect(self.persist_workspace_settings)
@@ -606,13 +625,13 @@ class MainWindow(QMainWindow):
         self.refresh_extract_source_picker()
         self.update_extract_source_visibility()
         self.update_output_destination()
-        button = QPushButton("开始提取")
-        button.setObjectName("primary")
-        button.clicked.connect(self.run_extract)
+        self.extract_button = QPushButton("开始提取")
+        self.extract_button.setObjectName("primary")
+        self.extract_button.clicked.connect(self.run_extract)
         self.extract_status = QLabel("等待运行")
         self.extract_status.setObjectName("muted")
         layout.addWidget(card)
-        layout.addWidget(button, 0, Qt.AlignLeft)
+        layout.addWidget(self.extract_button, 0, Qt.AlignLeft)
         layout.addWidget(self.extract_status)
         layout.addStretch()
         return page
@@ -820,6 +839,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, "extract_source_pick"):
                 self.store.set("extract_direct_source_id", self.extract_source_pick.currentData() or "")
             self.store.set("extract_dedup_fields", self.dedup_fields.text().strip() or "号码,日期")
+            if hasattr(self, "extract_signature_enabled"):
+                self.store.set("extract_signature_enabled", self.extract_signature_enabled.isChecked())
+                self.store.set("extract_signature_header", self.extract_signature_header.text().strip() or "签字")
+                self.store.set("extract_signature_column", self.extract_signature_column.currentText().strip().upper())
             date_field = self.extract_date_field.currentText().strip()
             if date_field:
                 self.store.set("extract_date_field", date_field)
@@ -1134,13 +1157,18 @@ class MainWindow(QMainWindow):
             ),
             self.extract_finished,
             "正在按时间提取…",
+            self.extract_button,
+            self.extract_failed,
         )
 
     def extract_finished(self, result: dict[str, int]) -> None:
-        message = f"已写入 {result['written']} 行；排除重复 {result['duplicates']} 行；无效日期 {result['invalid_dates']} 行。"
+        message = f"提取已结束：已写入 {result['written']} 行；排除重复 {result['duplicates']} 行；无效日期 {result['invalid_dates']} 行。"
         self.extract_status.setText(message)
         self.refresh_logs()
         QMessageBox.information(self, "提取完成", message)
+
+    def extract_failed(self, message: str) -> None:
+        self.extract_status.setText(f"提取已结束：失败。{message}")
 
     def load_fields_table(self) -> None:
         self.schema_editor.set_schema(self.store.get("column_schema", []))
@@ -1346,8 +1374,17 @@ class MainWindow(QMainWindow):
         self.store.set("credential_path", self.default_credential.text().strip())
         QMessageBox.information(self, "已保存", "设置已经保存。")
 
-    def run_task(self, job: Callable[[], object], success: Callable[[object], None], status: str, button: QPushButton | None = None) -> None:
+    def run_task(
+        self,
+        job: Callable[[], object],
+        success: Callable[[object], None],
+        status: str,
+        button: QPushButton | None = None,
+        failure: Callable[[str], None] | None = None,
+    ) -> None:
         self.statusBar().showMessage(status)
+        if button:
+            button.setEnabled(False)
         task = TaskThread(job, self)
         self.tasks.append(task)
 
@@ -1364,6 +1401,8 @@ class MainWindow(QMainWindow):
             if button:
                 button.setEnabled(True)
             self.refresh_logs()
+            if failure:
+                failure(message)
             QMessageBox.critical(self, "操作失败", message)
             self.tasks.remove(task)
             task.deleteLater()

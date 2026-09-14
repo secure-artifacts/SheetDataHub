@@ -15,7 +15,7 @@ import openpyxl
 from .config_store import ConfigStore
 from .database import AggregateDatabase
 from .models import Record, SourceConfig
-from .source_reader import SourceReader, google_retry, schema_field_names, spreadsheet_id
+from .source_reader import SourceReader, column_index, google_retry, schema_field_names, spreadsheet_id
 
 
 ProgressFn = Callable[[str], None]
@@ -485,7 +485,9 @@ class DataEngine:
         else:
             destination = Path(output)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            headers = self._preferred_export_headers(selected_records, prefer_record_headers=direct)
+            headers = self._signature_headers(
+                self._preferred_export_headers(selected_records, prefer_record_headers=direct)
+            )
             self._write_xlsx(
                 destination,
                 selected_records,
@@ -516,6 +518,28 @@ class DataEngine:
                 return ["来源", *[name for name in configured if name != "来源"]]
         headers, _ = self._export_rows(records)
         return headers
+
+    def _signature_headers(self, headers: list[str]) -> list[str]:
+        if not self.store.get("extract_signature_enabled", False):
+            return headers
+        signature = str(self.store.get("extract_signature_header", "签字") or "签字").strip()
+        if not signature:
+            return headers
+        result = list(headers)
+        if signature in result:
+            return result
+        column = str(self.store.get("extract_signature_column", "") or "").strip()
+        if column:
+            index = column_index(column)
+            while len(result) <= index:
+                result.append("")
+            if not result[index]:
+                result[index] = signature
+            else:
+                result.append(signature)
+            return result
+        result.append(signature)
+        return result
 
     @classmethod
     def _canonical_header(cls, header: str, aliases: dict[str, list[str]]) -> str:
@@ -646,7 +670,7 @@ class DataEngine:
         )
         target_name = sheet_name.strip() or "提取结果"
         aliases = self.store.get("field_aliases", {})
-        required_headers = self._preferred_export_headers(records, prefer_record_headers)
+        required_headers = self._signature_headers(self._preferred_export_headers(records, prefer_record_headers))
         sheet_names = {item["properties"]["title"] for item in metadata.get("sheets", [])}
         created = target_name not in sheet_names
         if created:
@@ -683,11 +707,6 @@ class DataEngine:
             existing_header = (header_response.get("values") or [[]])[0]
             while existing_header and not str(existing_header[-1]).strip():
                 existing_header.pop()
-        if existing_header and not self._headers_compatible(existing_header, required_headers, aliases):
-            raise ValueError(
-                f"目标工作表“{target_name}”的表头与提取字段不一致。"
-                f"现有：{existing_header}；需要包含：{required_headers}"
-            )
         headers = existing_header or required_headers
         rows = self._rows_for_headers(records, headers, aliases)
         payload = ([headers] if not existing_header else []) + rows

@@ -312,6 +312,36 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(rows[0], ("来源", "交教会日期", "线索电话号码", "摸底/推广"))
             self.assertEqual(rows[1], ("浇灌数据库-过滤", "2026-09-13", "258851758692", "简单"))
 
+    def test_direct_extract_signature_column_is_added_to_new_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ConfigStore(root / "config")
+            store.set("extract_signature_enabled", True)
+            store.set("extract_signature_header", "签字")
+            store.set("extract_signature_column", "K")
+            engine = DataEngine(store)
+            output = root / "signature.xlsx"
+            records = [
+                Record(
+                    "src", "源", "g", "浇灌数据库-过滤", 2,
+                    {"交教会日期": "2026-09-13", "线索电话号码": "258851758692", "摸底/推广": "简单"},
+                    "h1",
+                )
+            ]
+            with patch.object(engine, "read_sources", return_value=records):
+                result = engine.extract(
+                    "日期", date(2026, 9, 1), date(2026, 9, 30),
+                    output, ["号码", "日期"], direct=True,
+                )
+            self.assertEqual(result["written"], 1)
+            workbook = openpyxl.load_workbook(output, read_only=True, data_only=True)
+            try:
+                row = next(workbook.active.iter_rows(values_only=True))
+            finally:
+                workbook.close()
+            self.assertEqual(row[0], "来源")
+            self.assertEqual(row[10], "签字")
+
     def test_extract_output_schema_supports_column_mapping_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
@@ -620,6 +650,49 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(http.appended[0], [
             "1008-李薇", "42", "李薇", "A", "12:00", "女", "https://example.test",
             "258851758692", "2026-09-13",
+        ])
+
+    def test_google_output_uses_existing_headers_without_rejecting_mismatch(self):
+        existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期", "签字"]
+
+        class FakeHttp:
+            def __init__(self):
+                self.appended = []
+
+            def fetch_sheet_metadata(self, key, params=None):
+                return {"sheets": [{"properties": {"sheetId": 1, "title": "提取表格"}}]}
+
+            def values_get(self, key, range_name, params=None):
+                return {"values": [existing]}
+
+            def values_append(self, key, range_name, params=None, body=None):
+                self.appended.extend(body["values"])
+
+        http = FakeHttp()
+        client = SimpleNamespace(http_client=http)
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.set("credential_path", "fake.json")
+            engine = DataEngine(store)
+            records = [Record(
+                "s", "源", "g", "1008-李薇", 2,
+                {
+                    "日期": "2026-09-13", "名字": "李薇", "号码": "258851758692",
+                    "专页ID": "42", "评论贴文": "https://example.test",
+                },
+                "h",
+            )]
+            with patch.object(SourceReader, "_gspread_client", return_value=client):
+                engine._write_google_sheet(
+                    "https://docs.google.com/spreadsheets/d/abcdefghijklmnopqrstuvwxyz",
+                    "提取表格",
+                    records,
+                    "测试",
+                    prefer_record_headers=True,
+                )
+        self.assertEqual(http.appended[0], [
+            "1008-李薇", "42", "李薇", "", "", "", "https://example.test",
+            "258851758692", "2026-09-13", "",
         ])
 
 
