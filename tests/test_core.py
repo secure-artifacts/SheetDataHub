@@ -14,7 +14,7 @@ from sheet_hub.database import AggregateDatabase
 from sheet_hub.engine import DataEngine, parse_date
 from sheet_hub.models import Record, SourceConfig
 from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry, parse_schema_lines
-from sheet_hub.version import APP_VERSION, is_newer, parse_version
+from sheet_hub.version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer, parse_version
 
 
 class RuleTests(unittest.TestCase):
@@ -46,7 +46,51 @@ class RuleTests(unittest.TestCase):
 
     def test_date_parsing(self):
         self.assertEqual(parse_date("2026/09/13"), date(2026, 9, 13))
+        self.assertEqual(parse_date("2026年9月13日"), date(2026, 9, 13))
         self.assertIsNone(parse_date("not-a-date"))
+
+    def test_update_release_selects_and_downloads_installer(self):
+        class FakeJsonResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "tag_name": "v9.9.9",
+                    "html_url": "https://example.test/release",
+                    "assets": [{
+                        "name": "SheetDataHub-Setup.exe",
+                        "browser_download_url": "https://example.test/setup.exe",
+                        "size": 1024 * 1024 + 2,
+                    }],
+                }
+
+        with patch("sheet_hub.version.requests.get", return_value=FakeJsonResponse()):
+            info = fetch_latest_release()
+        self.assertEqual(info["installer_url"], "https://example.test/setup.exe")
+
+        payload = b"MZ" + (b"x" * (1024 * 1024))
+
+        class FakeDownloadResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                yield payload
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sheet_hub.version.requests.get", return_value=FakeDownloadResponse()
+        ):
+            path = download_release_installer(info, directory)
+            self.assertEqual(path.read_bytes()[:2], b"MZ")
 
     def test_google_429_is_retried(self):
         class QuotaError(Exception):
@@ -165,6 +209,73 @@ class DatabaseTests(unittest.TestCase):
             )
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0][1].sheet_name, "B")
+
+    def test_custom_headers_are_resolved_for_query_date_and_phone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record(
+                    "s", "源", "g", "A", 2,
+                    {
+                        "交教会日期": "2026年9月13日",
+                        "线索电话号码": "258-851-758692",
+                        "摸底/推广": "简\u200b 单",
+                    },
+                    "h1",
+                ),
+            ])
+            results = engine.query_many(
+                "摸底/推广", ["简单"], exact=False, date_field="日期",
+                start_date=date(2026, 9, 1), end_date=date(2026, 9, 30),
+            )
+            self.assertIsNotNone(results[0][1])
+            self.assertEqual(engine.query("号码", "258851758692")[0].sheet_name, "A")
+            self.assertEqual(
+                engine.suggest_field(["交教会日期", "摸底/推广"], "日期"),
+                "交教会日期",
+            )
+
+    def test_extract_resolves_custom_date_and_dedup_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ConfigStore(root / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record(
+                    "s", "源", "g", "A", 2,
+                    {"交教会日期": "2026-09-13", "线索电话号码": "123"},
+                    "h1",
+                ),
+            ])
+            first = engine.extract(
+                "日期", date(2026, 9, 1), date(2026, 9, 30),
+                root / "one.xlsx", ["号码", "日期"],
+            )
+            second = engine.extract(
+                "日期", date(2026, 9, 1), date(2026, 9, 30),
+                root / "two.xlsx", ["号码", "日期"],
+            )
+            self.assertEqual(first["written"], 1)
+            self.assertEqual(second["duplicates"], 1)
+
+    def test_extract_output_schema_supports_column_mapping_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.set("extract_column_schema_enabled", True)
+            store.set("extract_column_schema", [
+                {"name": "线索电话号码", "column": "S", "enabled": True},
+                {"name": "交教会日期", "column": "F", "enabled": True},
+            ])
+            engine = DataEngine(store)
+            headers = engine._preferred_export_headers([])
+            self.assertEqual(headers, ["来源", "线索电话号码", "交教会日期"])
+            rows = engine._rows_for_headers(
+                [Record("s", "源", "g", "A", 2, {"号码": "123", "日期": "2026-09-13"}, "h")],
+                headers,
+                store.get("field_aliases"),
+            )
+            self.assertEqual(rows[0], ["A", "123", "2026-09-13"])
 
     def test_query_extract_table_is_faster_subset(self):
         with tempfile.TemporaryDirectory() as directory:

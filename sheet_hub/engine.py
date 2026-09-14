@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from datetime import date, datetime
@@ -24,6 +25,8 @@ def parse_date(value: str) -> date | None:
     text = str(value).strip()
     if not text:
         return None
+    text = re.sub(r"\s*(年|月)\s*", lambda match: "-" if match.group(1) in {"年", "月"} else match.group(0), text)
+    text = re.sub(r"\s*日\s*$", "", text)
     if "T" in text:
         text = text.split("T", 1)[0]
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S"):
@@ -38,6 +41,14 @@ def parse_date(value: str) -> date | None:
 
 
 class DataEngine:
+    SEMANTIC_FIELD_HINTS = {
+        "日期": ("日期", "date", "datetime"),
+        "号码": ("手机", "电话", "号码", "phone", "number", "tel"),
+        "名字": ("姓名", "名字", "名称", "name"),
+        "链接": ("链接", "网址", "link", "url"),
+        "来源": ("来源", "渠道", "平台", "source"),
+    }
+
     def __init__(self, store: ConfigStore, progress: ProgressFn | None = None):
         self.store = store
         self.progress = progress or (lambda message: None)
@@ -173,6 +184,18 @@ class DataEngine:
                 return str(canonical)
         return str(field).strip()
 
+    def _field_kind(self, field: str) -> str:
+        canonical = self._canonical_field(field)
+        if canonical in self.SEMANTIC_FIELD_HINTS:
+            return canonical
+        folded = str(field).strip().casefold()
+        matches = [
+            standard
+            for standard, hints in self.SEMANTIC_FIELD_HINTS.items()
+            if any(hint in folded for hint in hints)
+        ]
+        return matches[0] if len(matches) == 1 else canonical
+
     def _field_value(self, record: Record, field: str) -> str:
         folded = str(field).strip().casefold()
         aliases = self.store.get("field_aliases", {})
@@ -194,7 +217,33 @@ class DataEngine:
             for stored, value in record.values.items():
                 if str(stored).strip().casefold() == key and str(value).strip():
                     return str(value)
+        canonical = self._field_kind(field)
+        hints = self.SEMANTIC_FIELD_HINTS.get(canonical, ())
+        semantic_matches = [
+            value
+            for stored, value in record.values.items()
+            if str(value).strip() and any(hint in str(stored).strip().casefold() for hint in hints)
+        ]
+        # Only infer a custom field when it is unambiguous. This supports names
+        # such as “交教会日期” and “线索电话号码” without guessing between two dates.
+        if len(semantic_matches) == 1:
+            return str(semantic_matches[0])
         return ""
+
+    def suggest_field(self, fields: list[str], preferred: str) -> str:
+        """Find the best visible field for a generic/saved field name."""
+        clean_fields = self._unique_headers(fields)
+        folded = str(preferred).strip().casefold()
+        for field in clean_fields:
+            if field.casefold() == folded:
+                return field
+        canonical = self._field_kind(preferred)
+        alias_matches = [field for field in clean_fields if self._field_kind(field) == canonical]
+        if len(alias_matches) == 1:
+            return alias_matches[0]
+        hints = self.SEMANTIC_FIELD_HINTS.get(canonical, ())
+        semantic = [field for field in clean_fields if any(hint in field.casefold() for hint in hints)]
+        return semantic[0] if semantic else ""
 
     @staticmethod
     def corrected_source(source: str) -> str:
@@ -205,7 +254,7 @@ class DataEngine:
 
     def _query_values(self, record: Record, field: str) -> list[str]:
         values = [self._field_value(record, field)]
-        if self._canonical_field(field).casefold() == "来源":
+        if self._field_kind(field).casefold() == "来源":
             values.extend((record.sheet_name, self.corrected_source(record.sheet_name)))
         return self._unique_headers(values)
 
@@ -213,7 +262,7 @@ class DataEngine:
         folded = str(field).strip().casefold()
         if folded == "修正格式":
             return self.corrected_source(record.sheet_name)
-        if self._canonical_field(field).casefold() == "来源":
+        if self._field_kind(field).casefold() == "来源":
             return record.sheet_name
         return self._field_value(record, field)
 
@@ -324,8 +373,11 @@ class DataEngine:
                 raise ValueError("开始日期不能晚于结束日期")
             before = len(records)
             filtered: list[Record] = []
+            valid_date_count = 0
             for record in records:
                 current = parse_date(self._field_value(record, date_field))
+                if current is not None:
+                    valid_date_count += 1
                 if current is not None and start_date <= current <= end_date:
                     filtered.append(record)
             records = filtered
@@ -334,7 +386,12 @@ class DataEngine:
                 "INFO",
                 f"日期限制：字段“{date_field}”，{start_date.isoformat()} 至 {end_date.isoformat()}，保留 {len(records)}/{before} 行",
             )
-        canonical = self._canonical_field(field)
+            if before and valid_date_count == 0:
+                raise ValueError(
+                    f"日期字段“{date_field}”在读取的 {before} 行中没有可识别日期。"
+                    "请从下拉框选择当前数据表实际使用的日期列。"
+                )
+        canonical = self._field_kind(field)
         results: list[tuple[str, Record | None]] = []
         matched_inputs = 0
         for query_value in queries:
@@ -358,9 +415,10 @@ class DataEngine:
 
     @staticmethod
     def _match_value(field: str, value: str) -> str:
-        text = str(value).strip().casefold().lstrip("'")
+        text = unicodedata.normalize("NFKC", str(value)).strip().casefold().lstrip("'")
+        text = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", text)
         if field.strip().casefold() not in {"号码", "手机号", "手机号码", "电话", "联系电话", "phone", "number"}:
-            return text
+            return re.sub(r"\s+", "", text)
         compact = re.sub(r"[\s,，\-()（）]", "", text)
         if re.fullmatch(r"[+-]?\d+(?:\.0+)?", compact):
             return compact.split(".", 1)[0].lstrip("+")
@@ -392,13 +450,13 @@ class DataEngine:
         skipped_invalid = 0
         skipped_duplicate = 0
         for record in records:
-            current = parse_date(record.values.get(date_field, ""))
+            current = parse_date(self._field_value(record, date_field))
             if current is None:
                 skipped_invalid += 1
                 continue
             if not start <= current <= end:
                 continue
-            parts = [record.values.get(field, "") for field in dedup_fields]
+            parts = [self._field_value(record, field) for field in dedup_fields]
             if not any(parts):
                 parts = [record.spreadsheet_id, record.sheet_name, str(record.row_number), record.row_hash]
             key = hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode("utf-8")).hexdigest()
@@ -406,6 +464,11 @@ class DataEngine:
                 skipped_duplicate += 1
                 continue
             selected.append((record, key))
+        if records and skipped_invalid == len(records):
+            raise ValueError(
+                f"日期字段“{date_field}”在读取的 {len(records)} 行中没有可识别日期。"
+                "请在“日期字段”中选择数据源实际使用的日期列。"
+            )
         selected_records = [record for record, _ in selected]
         if destination_type == "google":
             if not google_output_url.strip():
@@ -433,19 +496,19 @@ class DataEngine:
         return {"written": len(selected), "duplicates": skipped_duplicate, "invalid_dates": skipped_invalid}
 
     def _preferred_export_headers(self, records: list[Record]) -> list[str]:
+        if self.store.get("extract_column_schema_enabled", False):
+            configured = schema_field_names(self.store.get("extract_column_schema", []))
+            if configured:
+                return ["来源", *[name for name in configured if name != "来源"]]
         if self.store.get("column_schema_enabled", False):
-            configured = [
-                str(name).strip()
-                for name in self.store.get("column_schema", [])
-                if str(name).strip()
-            ]
+            configured = schema_field_names(self.store.get("column_schema", []))
             if configured:
                 return ["来源", *[name for name in configured if name != "来源"]]
         headers, _ = self._export_rows(records)
         return headers
 
-    @staticmethod
-    def _canonical_header(header: str, aliases: dict[str, list[str]]) -> str:
+    @classmethod
+    def _canonical_header(cls, header: str, aliases: dict[str, list[str]]) -> str:
         clean = str(header).strip()
         folded = clean.casefold()
         if folded == "来源":
@@ -456,6 +519,13 @@ class DataEngine:
                 for name in [canonical, *candidates]
             }:
                 return canonical
+        semantic = [
+            standard
+            for standard, hints in cls.SEMANTIC_FIELD_HINTS.items()
+            if any(hint in folded for hint in hints)
+        ]
+        if len(semantic) == 1:
+            return semantic[0]
         return clean
 
     @classmethod
@@ -484,7 +554,17 @@ class DataEngine:
                 if canonical == "来源":
                     row.append(record.sheet_name)
                 else:
-                    row.append(record.values.get(canonical, record.values.get(header, "")))
+                    value = record.values.get(canonical, record.values.get(header, ""))
+                    if not str(value).strip() and canonical in cls.SEMANTIC_FIELD_HINTS:
+                        matches = [
+                            candidate
+                            for stored, candidate in record.values.items()
+                            if str(candidate).strip()
+                            and any(hint in str(stored).strip().casefold() for hint in cls.SEMANTIC_FIELD_HINTS[canonical])
+                        ]
+                        if len(matches) == 1:
+                            value = matches[0]
+                    row.append(value)
             rows.append(row)
         return rows
 

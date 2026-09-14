@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDate, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QDate, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -49,7 +50,7 @@ from .source_reader import (
     schema_field_names,
     split_names,
 )
-from .version import APP_VERSION, RELEASES_URL, fetch_latest_release, is_newer
+from .version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer
 
 
 APP_TITLE = "表数通"
@@ -337,7 +338,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.nav, 1)
         self.version_label = QLabel(f"v{APP_VERSION}")
         self.version_label.setObjectName("sidebarMuted")
-        self.sidebar_update_button = QPushButton("检查更新")
+        self.sidebar_update_button = QPushButton("检查并安装更新")
         self.sidebar_update_button.clicked.connect(self.check_updates)
         sidebar_layout.addWidget(self.version_label)
         sidebar_layout.addWidget(self.sidebar_update_button)
@@ -573,7 +574,7 @@ class MainWindow(QMainWindow):
         form.addRow("", self.extract_schema_enabled)
         form.addRow("提取表字段", self.extract_schema_editor)
         self.output_type.currentIndexChanged.connect(self.update_output_destination)
-        self.extract_mode.currentIndexChanged.connect(self.persist_workspace_settings)
+        self.extract_mode.currentIndexChanged.connect(self.on_extract_mode_changed)
         self.dedup_fields.editingFinished.connect(self.persist_workspace_settings)
         self.google_output_url.editingFinished.connect(self.persist_workspace_settings)
         self.output_sheet_name.editingFinished.connect(self.persist_workspace_settings)
@@ -677,7 +678,7 @@ class MainWindow(QMainWindow):
         form.addRow("本地数据目录", data_path)
         version_row = QHBoxLayout()
         version_row.addWidget(QLabel(f"当前版本 v{APP_VERSION}"))
-        self.update_button = QPushButton("检查更新")
+        self.update_button = QPushButton("检查并安装更新")
         self.update_button.clicked.connect(self.check_updates)
         version_row.addWidget(self.update_button)
         version_row.addStretch()
@@ -901,10 +902,14 @@ class MainWindow(QMainWindow):
         saved_date_field = str(self.store.get("query_date_field", "日期") or "日期").strip()
         self.query_date_field.clear()
         self.query_date_field.addItems(fields)
-        date_pick = current_date_field if current_date_field in fields else saved_date_field
+        date_pick = ""
+        for candidate in (current_date_field, saved_date_field):
+            if candidate in fields:
+                date_pick = candidate
+                break
+        if not date_pick:
+            date_pick = DataEngine(self.store).suggest_field(fields, "日期")
         if date_pick:
-            if date_pick not in fields:
-                self.query_date_field.insertItem(0, date_pick)
             self.query_date_field.setCurrentText(date_pick)
         self._restoring_settings = restoring
 
@@ -1105,17 +1110,8 @@ class MainWindow(QMainWindow):
 
     def refresh_field_controls(self) -> None:
         aliases = self.store.get("field_aliases", {})
-        fields = list(aliases.keys())
-        alias_lookup = {
-            str(name).strip().casefold(): canonical
-            for canonical, names in aliases.items()
-            for name in [canonical, *names]
-        }
-        if self.store.get("column_schema_enabled", False):
-            for header in self.store.get("column_schema", []):
-                field = alias_lookup.get(str(header).strip().casefold(), str(header).strip())
-                if field and field not in fields:
-                    fields.append(field)
+        mode = "direct" if hasattr(self, "extract_mode") and self.extract_mode.currentIndex() == 1 else "aggregate"
+        fields = DataEngine(self.store).list_query_fields(mode) or list(aliases.keys())
         restoring = self._restoring_settings
         self._restoring_settings = True
         current_date = self.extract_date_field.currentText() if hasattr(self, "extract_date_field") else ""
@@ -1123,12 +1119,20 @@ class MainWindow(QMainWindow):
         if hasattr(self, "extract_date_field"):
             self.extract_date_field.clear()
             self.extract_date_field.addItems(fields)
-            date_field = current_date if current_date in fields else (saved_date if saved_date in fields else ("日期" if "日期" in fields else (fields[0] if fields else "")))
+            date_field = current_date if current_date in fields else (saved_date if saved_date in fields else "")
+            if not date_field:
+                date_field = DataEngine(self.store).suggest_field(fields, "日期") or (fields[0] if fields else "")
             if date_field:
                 self.extract_date_field.setCurrentText(date_field)
         self._restoring_settings = restoring
         self.refresh_query_source_picker()
         self.refresh_query_fields()
+
+    def on_extract_mode_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.refresh_field_controls()
+        self.persist_workspace_settings()
 
     def refresh_logs(self) -> None:
         rows = self.store.read_logs()
@@ -1159,7 +1163,7 @@ class MainWindow(QMainWindow):
                 return
             if is_newer(str(info.get("version") or ""), APP_VERSION):
                 self.statusBar().showMessage(
-                    f"发现新版本 v{info['version']}，可点击「检查更新」下载",
+                    f"发现新版本 v{info['version']}，可点击「检查并安装更新」直接安装",
                     20000,
                 )
 
@@ -1209,14 +1213,41 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setWindowTitle("发现新版本")
             box.setText(f"当前版本：v{APP_VERSION}\n最新版本：v{latest}")
-            box.setInformativeText("下载后安装即可覆盖更新。")
-            open_button = box.addButton("打开下载页", QMessageBox.AcceptRole)
+            box.setInformativeText("软件将自动下载安装包，随后关闭当前版本并启动安装。")
+            install_button = box.addButton("立即下载安装", QMessageBox.AcceptRole)
             box.addButton("稍后", QMessageBox.RejectRole)
             box.exec()
-            if box.clickedButton() is open_button:
-                QDesktopServices.openUrl(QUrl(str(info.get("url") or RELEASES_URL)))
+            if box.clickedButton() is install_button:
+                self.download_and_install_update(info)
             return
         QMessageBox.information(self, "已是最新", f"当前已经是最新版本 v{APP_VERSION}。")
+
+    def download_and_install_update(self, info: dict[str, str]) -> None:
+        self._set_update_buttons_enabled(False)
+        self.statusBar().showMessage("正在下载安装包，请稍候…")
+        task = TaskThread(lambda: download_release_installer(info, self.store.data_dir), self)
+        self.tasks.append(task)
+
+        def done(path: object) -> None:
+            self._set_update_buttons_enabled(True)
+            self.tasks.remove(task)
+            task.deleteLater()
+            installer = Path(str(path))
+            QMessageBox.information(self, "下载完成", "安装包已下载，将关闭当前软件并启动安装程序。")
+            subprocess.Popen([str(installer)], cwd=str(installer.parent))
+            QApplication.quit()
+
+        def failed(message: str) -> None:
+            self._set_update_buttons_enabled(True)
+            if task in self.tasks:
+                self.tasks.remove(task)
+            task.deleteLater()
+            self.statusBar().showMessage("更新下载失败", 8000)
+            QMessageBox.critical(self, "更新失败", message)
+
+        task.succeeded.connect(done)
+        task.failed.connect(failed)
+        task.start()
 
     def choose_default_credential(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择服务账号 JSON", "", "JSON 文件 (*.json)")
