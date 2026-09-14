@@ -513,9 +513,13 @@ class MainWindow(QMainWindow):
         hint = QLabel("提取表、汇总库、每个数据源都可以用各自表头查询。查数据源时先选数据表，查询字段会跟着切换；也可以直接输入列名。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
+        self.query_result_summary = QLabel("查询结果：0 条")
+        self.query_result_summary.setObjectName("muted")
+        self.query_result_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addLayout(bar)
         layout.addLayout(date_bar)
         layout.addWidget(hint)
+        layout.addWidget(self.query_result_summary)
         layout.addWidget(self.query_table, 1)
         self.update_query_date_controls()
         return page
@@ -937,6 +941,8 @@ class MainWindow(QMainWindow):
         result_fields = engine.list_query_fields(source, extract_target, extract_sheet, source_id)
         if not result_fields:
             result_fields = [field]
+        if hasattr(self, "query_result_summary"):
+            self.query_result_summary.setText(f"正在查询：输入 {len(values)} 个值…")
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
@@ -996,7 +1002,11 @@ class MainWindow(QMainWindow):
                 header.setSectionResizeMode(column, QHeaderView.Stretch)
         self.copy_query_button.setEnabled(bool(self.query_copy_rows))
         missing = len(results) - found
-        message = f"查询完成：输出 {len(results)} 行，匹配 {found} 行"
+        input_count = len({str(query_value) for query_value, _ in results})
+        summary = f"查询结果：共 {len(results)} 条；匹配 {found} 条；未找到 {missing} 条；输入 {input_count} 个值"
+        if hasattr(self, "query_result_summary"):
+            self.query_result_summary.setText(summary)
+        message = f"查询完成：共 {len(results)} 条，匹配 {found} 条"
         if self.query_mode.currentIndex() == 0 and missing:
             message += "；未找到的可把表格来源改成「直接查询数据源」再查一次"
         self.statusBar().showMessage(message, 8000)
