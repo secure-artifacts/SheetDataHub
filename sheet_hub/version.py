@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 
-APP_VERSION = "1.2.13"
+APP_VERSION = "1.2.14"
 UPDATE_REPO = "secure-artifacts/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 

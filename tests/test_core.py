@@ -14,7 +14,7 @@ from sheet_hub.database import AggregateDatabase
 from sheet_hub.engine import DataEngine, parse_date
 from sheet_hub.models import Record, SourceConfig
 from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry, parse_schema_lines
-from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, query_result_headers
+from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, is_phone_data_table, query_result_headers
 from sheet_hub.version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer, parse_version
 
 
@@ -142,17 +142,45 @@ class RuleTests(unittest.TestCase):
             store = ConfigStore(directory)
             source_headers = ["预交表汇总", "见证状态", "交教会日期", "摸底/推广", "线索电话号码"]
             self.assertEqual(
-                query_result_headers(store, "extract", "摸底/推广", source_headers),
-                DEFAULT_QUERY_RESULT_FIELDS,
-            )
-            self.assertEqual(
-                query_result_headers(store, "direct", "线索电话号码", source_headers),
-                DEFAULT_QUERY_RESULT_FIELDS,
-            )
-            self.assertEqual(
-                query_result_headers(store, "direct", "摸底/推广", source_headers),
+                query_result_headers(store, "direct", "线索电话号码", source_headers, "交教会"),
                 source_headers,
             )
+            self.assertEqual(
+                query_result_headers(store, "direct", "摸底/推广", source_headers, "交教会"),
+                source_headers,
+            )
+            self.assertEqual(
+                query_result_headers(store, "direct", "号码", ["专页ID", "姓名", "号码"], "号码表"),
+                DEFAULT_QUERY_RESULT_FIELDS,
+            )
+            self.assertFalse(is_phone_data_table(source_headers, "交教会"))
+            self.assertTrue(is_phone_data_table(["专页ID", "号码"], "交教会"))
+
+    def test_source_cache_and_selected_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ConfigStore(root / "config")
+            path = root / "club.xlsx"
+            book = openpyxl.Workbook()
+            book.active.title = "数据"
+            book.active.append(["加友途径4", "贴文ID"])
+            book.active.append(["2081专页后台", "p1"])
+            book.save(path)
+            store.save_source(SourceConfig(
+                "club", "交教会", str(path),
+                column_schema_enabled=True,
+                column_schema=[
+                    {"name": "加友途径4", "column": "A", "enabled": True},
+                    {"name": "贴文ID", "column": "B", "enabled": True},
+                ],
+            ))
+            engine = DataEngine(store)
+            synced = engine.sync(["club"], write_local_db=True)
+            self.assertEqual(synced["sources"], 1)
+            self.assertTrue(engine.cache.has("club"))
+            self.assertEqual(engine.list_query_fields("direct", source_id="club"), ["加友途径4", "贴文ID"])
+            found = engine.query("加友途径4", "2081专页后台", source="direct", source_id="club")
+            self.assertEqual(found[0].values["贴文ID"], "p1")
 
 
 class DatabaseTests(unittest.TestCase):

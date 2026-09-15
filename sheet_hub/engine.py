@@ -13,7 +13,7 @@ from typing import Callable
 import openpyxl
 
 from .config_store import ConfigStore
-from .database import AggregateDatabase
+from .database import AggregateDatabase, SourceCache
 from .models import Record, SourceConfig
 from .source_reader import SourceReader, column_index, google_retry, schema_field_names, spreadsheet_id
 
@@ -59,6 +59,10 @@ class DataEngine:
             self.store.data_dir / "databases",
             int(self.store.get("max_rows_per_db", 500000)),
         )
+
+    @property
+    def cache(self) -> SourceCache:
+        return SourceCache(self.store.data_dir / "source_cache")
 
     def _log(self, operation: str, level: str, message: str, detail: str = "") -> None:
         self.store.log(level, operation, message, detail)
@@ -114,17 +118,95 @@ class DataEngine:
             raise RuntimeError("所有数据源均读取失败，请查看日志")
         return records
 
-    def sync(self) -> dict[str, int]:
+    def _headers_for_source(self, source: SourceConfig, records: list[Record]) -> list[str]:
+        if source.column_schema_enabled:
+            names = schema_field_names(source.column_schema)
+            if names:
+                return names
+        seen: list[str] = []
+        for record in records[:50]:
+            for key in record.values:
+                if key not in seen:
+                    seen.append(key)
+        return seen
+
+    def refresh_cache(self, source_ids: list[str] | None = None, include_extract: bool = False) -> dict[str, int]:
+        operation = "刷新缓存"
+        selected = [source for source in self.store.load_sources() if source.enabled]
+        if source_ids:
+            wanted = {item.strip() for item in source_ids if item.strip()}
+            selected = [source for source in selected if source.id in wanted]
+        if not selected and not include_extract:
+            raise ValueError("没有可刷新的数据源")
+        total = 0
+        for source in selected:
+            self._log(operation, "INFO", f"正在缓存：{source.name}")
+            records = self.read_sources(operation, source.id)
+            total += self.cache.replace(source.id, records, self._headers_for_source(source, records), source.url)
+        if include_extract:
+            dest_type = str(self.store.get("extract_destination_type", "local") or "local")
+            target = str(self.store.get("google_output_url") if dest_type == "google" else self.store.get("extract_output_path") or "")
+            sheet = str(self.store.get("google_output_sheet") or "提取结果")
+            if target.strip():
+                records = self.read_extract_table(target, sheet)
+                total += self.cache.replace(
+                    "extract-table",
+                    records,
+                    schema_field_names(self.store.get("extract_column_schema", [])) or None,
+                    f"{target}#{sheet}",
+                )
+        self._log(operation, "INFO", f"缓存更新完成：{total} 行")
+        return {"rows": total, "sources": len(selected)}
+
+    def cached_records(self, source_ids: list[str], refresh: bool = False) -> list[Record]:
+        missing = [source_id for source_id in source_ids if refresh or not self.cache.has(source_id)]
+        if missing:
+            self.refresh_cache(missing)
+        records: list[Record] = []
+        for source_id in source_ids:
+            records.extend(self.cache.load(source_id))
+        return records
+
+    def sync(
+        self,
+        source_ids: list[str] | None = None,
+        write_local_db: bool | None = None,
+        google_output_url: str = "",
+        google_output_sheet: str = "汇总结果",
+        local_xlsx: str = "",
+    ) -> dict[str, int]:
         operation = "汇总同步"
         self._log(operation, "INFO", "汇总任务开始")
-        records = self.read_sources(operation)
-        if not self.store.get("write_aggregate", True):
-            self._log(operation, "INFO", f"已读取 {len(records)} 行；当前未启用写入汇总库")
-            return {"rows": len(records), "databases": 0}
-        unique = {record.row_hash: record for record in records}
-        row_count, db_count = self.database.replace_all(list(unique.values()))
-        self._log(operation, "INFO", f"汇总完成：写入 {row_count} 行，使用 {db_count} 个数据库文件")
-        return {"rows": row_count, "databases": db_count}
+        selected = [source for source in self.store.load_sources() if source.enabled]
+        if source_ids:
+            wanted = {item.strip() for item in source_ids if item.strip()}
+            selected = [source for source in selected if source.id in wanted]
+        if not selected:
+            raise ValueError("请选择至少一个数据源")
+        records: list[Record] = []
+        for source in selected:
+            loaded = self.read_sources(operation, source.id)
+            self.cache.replace(source.id, loaded, self._headers_for_source(source, loaded), source.url)
+            records.extend(loaded)
+            self._log(operation, "INFO", f"已缓存 {source.name}：{len(loaded)} 行")
+        unique = list({record.row_hash: record for record in records}.values())
+        write_db = self.store.get("write_aggregate", True) if write_local_db is None else write_local_db
+        db_count = 0
+        if write_db:
+            row_count, db_count = self.database.replace_all(unique)
+        else:
+            row_count = len(unique)
+        if google_output_url.strip():
+            self._write_google_sheet(google_output_url, google_output_sheet or "汇总结果", unique, operation)
+            self._log(operation, "INFO", f"已写入 Google 表格工作表“{google_output_sheet or '汇总结果'}”")
+        if local_xlsx.strip():
+            path = Path(local_xlsx)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            headers = self._preferred_export_headers(unique)
+            self._write_xlsx(path, unique, google_output_sheet or "汇总结果", headers, self.store.get("field_aliases", {}))
+            self._log(operation, "INFO", f"已写入本地文件：{path}")
+        self._log(operation, "INFO", f"汇总完成：{row_count} 行，缓存 {len(selected)} 个数据源")
+        return {"rows": row_count, "databases": db_count, "sources": len(selected)}
 
     def read_extract_table(self, target: str, sheet_name: str = "") -> list[Record]:
         path_or_url = str(target or "").strip()
@@ -288,16 +370,18 @@ class DataEngine:
         extract_sheet: str = "",
         source_id: str = "",
     ) -> list[str]:
-        fallback = list(self.store.get("field_aliases", {}).keys())
         mode = self.query_source_mode(mode, False)
         if mode == "extract":
             schema_names = schema_field_names(self.store.get("extract_column_schema", []))
             if self.store.get("extract_column_schema_enabled", False) and schema_names:
-                return self._unique_headers([*schema_names, *fallback])
+                return self._unique_headers(schema_names)
+            cached = self.cache.headers("extract-table")
+            if cached:
+                return self._unique_headers(cached)
             peeked = self._peek_headers(extract_target, extract_sheet)
             if peeked:
                 return self._unique_headers(peeked)
-            return self._unique_headers(["来源", *fallback])
+            return []
         if mode == "direct":
             sources = [source for source in self.store.load_sources() if source.enabled]
             if source_id.strip():
@@ -307,18 +391,18 @@ class DataEngine:
                 if source.column_schema_enabled and source.column_schema:
                     headers.extend(schema_field_names(source.column_schema))
                     continue
+                cached = self.cache.headers(source.id)
+                if cached:
+                    headers.extend(cached)
+                    continue
                 peeked = self._peek_headers(source.url, (source.include_sheets or [""])[0])
                 if peeked:
                     headers.extend(peeked)
-                elif self.store.get("column_schema_enabled", False):
-                    headers.extend(schema_field_names(self.store.get("column_schema", [])))
-            return self._unique_headers(headers) or self._unique_headers(fallback)
+            return self._unique_headers(headers)
         headers = []
         for record in self.database.sample_records(20):
             headers.extend(record.values.keys())
-        if self.store.get("column_schema_enabled", False):
-            headers.extend(schema_field_names(self.store.get("column_schema", [])))
-        return self._unique_headers(headers) or self._unique_headers(fallback)
+        return self._unique_headers(headers)
 
     def query(
         self,
@@ -333,10 +417,11 @@ class DataEngine:
         date_field: str = "",
         start_date: date | None = None,
         end_date: date | None = None,
+        refresh_cache: bool = False,
     ) -> list[Record]:
         results = self.query_many(
             field, [value], direct, exact, source, extract_target, extract_sheet, source_id,
-            date_field, start_date, end_date,
+            date_field, start_date, end_date, refresh_cache,
         )
         return [record for _, record in results if record is not None]
 
@@ -353,17 +438,32 @@ class DataEngine:
         date_field: str = "",
         start_date: date | None = None,
         end_date: date | None = None,
+        refresh_cache: bool = False,
     ) -> list[tuple[str, Record | None]]:
         mode = self.query_source_mode(source, direct)
-        operation = {"direct": "批量直接查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
+        operation = {"direct": "批量数据源查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
         queries = list(dict.fromkeys(value.strip() for value in values if value.strip()))
         if not queries:
-            raise ValueError("没有可查询的号码")
+            raise ValueError("没有可查询的内容")
         self._log(operation, "INFO", f"开始批量查询：{len(queries)} 个值，字段“{field}”")
         if mode == "extract":
-            records = self.read_extract_table(extract_target, extract_sheet)
+            cache_id = "extract-table"
+            cache_target = f"{extract_target}#{extract_sheet}"
+            if refresh_cache or not self.cache.has(cache_id) or self.cache._meta(cache_id, "target") != cache_target:
+                records = self.read_extract_table(extract_target, extract_sheet)
+                self.cache.replace(
+                    cache_id,
+                    records,
+                    schema_field_names(self.store.get("extract_column_schema", [])) or None,
+                    cache_target,
+                )
+            else:
+                records = self.cache.load(cache_id)
         elif mode == "direct":
-            records = self.read_sources(operation, source_id)
+            sources = [item for item in self.store.load_sources() if item.enabled]
+            if source_id.strip():
+                sources = [item for item in sources if item.id == source_id.strip()]
+            records = self.cached_records([item.id for item in sources], refresh=refresh_cache)
         else:
             records = self.database.all_records()
         if date_field.strip():

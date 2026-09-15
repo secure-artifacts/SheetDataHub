@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from .models import Record
@@ -113,3 +115,110 @@ class AggregateDatabase:
             if (haystack == needle) if exact else (needle in haystack):
                 result.append(record)
         return result
+
+
+class SourceCache:
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_id(source_id: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", str(source_id or "source"))[:80] or "source"
+
+    def path(self, source_id: str) -> Path:
+        return self.directory / f"{self._safe_id(source_id)}.sqlite"
+
+    def has(self, source_id: str) -> bool:
+        path = self.path(source_id)
+        return path.exists() and path.stat().st_size > 0
+
+    def replace(self, source_id: str, records: list[Record], headers: list[str] | None = None, target: str = "") -> int:
+        path = self.path(source_id)
+        temp = path.with_suffix(".tmp.sqlite")
+        if temp.exists():
+            temp.unlink()
+        conn = sqlite3.connect(temp)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    row_hash TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    spreadsheet_id TEXT NOT NULL,
+                    sheet_name TEXT NOT NULL,
+                    row_number INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE INDEX ix_records_sheet ON records(sheet_name);
+                """
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO records(row_hash,source_id,source_name,spreadsheet_id,sheet_name,row_number,payload) VALUES(?,?,?,?,?,?,?)",
+                [
+                    (r.row_hash, r.source_id, r.source_name, r.spreadsheet_id, r.sheet_name, r.row_number,
+                     json.dumps(r.values, ensure_ascii=False))
+                    for r in records
+                ],
+            )
+            keys = list(headers or [])
+            if not keys:
+                seen: list[str] = []
+                for record in records[:50]:
+                    for key in record.values:
+                        if key not in seen:
+                            seen.append(key)
+                keys = seen
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("headers", json.dumps(keys, ensure_ascii=False)))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("rows", str(len(records))))
+            if target:
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("target", str(target)))
+            conn.commit()
+        finally:
+            conn.close()
+        if path.exists():
+            path.unlink()
+        temp.replace(path)
+        return len(records)
+
+    def load(self, source_id: str) -> list[Record]:
+        if not self.has(source_id):
+            return []
+        conn = sqlite3.connect(self.path(source_id))
+        try:
+            rows = conn.execute(
+                "SELECT source_id,source_name,spreadsheet_id,sheet_name,row_number,payload,row_hash FROM records"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [Record(*row[:5], json.loads(row[5]), row[6]) for row in rows]
+
+    def headers(self, source_id: str) -> list[str]:
+        return [str(item) for item in json.loads(self._meta(source_id, "headers") or "[]")]
+
+    def updated_at(self, source_id: str) -> str:
+        return self._meta(source_id, "updated_at")
+
+    def row_count(self, source_id: str) -> int:
+        try:
+            return int(self._meta(source_id, "rows") or 0)
+        except ValueError:
+            return 0
+
+    def _meta(self, source_id: str, key: str) -> str:
+        if not self.has(source_id):
+            return ""
+        conn = sqlite3.connect(self.path(source_id))
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        except sqlite3.Error:
+            return ""
+        finally:
+            conn.close()
+        return str(row[0]) if row else ""

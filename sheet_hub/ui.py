@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -57,6 +58,19 @@ APP_TITLE = "表数通"
 QUERY_SOURCES = ["extract", "aggregate", "direct"]
 COLUMN_LETTERS = [excel_column(index) for index in range(52)]
 DEFAULT_QUERY_RESULT_FIELDS = ["输入电话号码", "专页ID", "姓名", "评论贴文", "号码", "日期", "修正格式"]
+PHONE_HEADERS = {"号码", "手机号", "手机号码", "电话", "联系电话", "phone", "number"}
+PHONE_TABLE_NAME_HINTS = ("号码表", "号码数据")
+PAGE_ID_HEADERS = {"专页id", "pageid"}
+
+
+def is_phone_data_table(fields: list[str] | None = None, source_name: str = "") -> bool:
+    name = str(source_name or "")
+    if any(hint in name for hint in PHONE_TABLE_NAME_HINTS):
+        return True
+    folded = {str(item).strip().casefold() for item in (fields or [])}
+    has_phone = any(item.casefold() in folded for item in PHONE_HEADERS)
+    has_page = any(item.casefold() in folded for item in PAGE_ID_HEADERS)
+    return has_phone and has_page
 
 
 def query_result_headers(
@@ -64,11 +78,12 @@ def query_result_headers(
     source: str,
     query_field: str,
     result_fields: list[str],
+    source_name: str = "",
 ) -> list[str]:
-    engine = DataEngine(store)
-    if source == "extract" or engine._field_kind(query_field).casefold() == "号码":
+    table_fields = list(result_fields or [])
+    if is_phone_data_table(table_fields, source_name):
         return DEFAULT_QUERY_RESULT_FIELDS.copy()
-    return result_fields or [query_field]
+    return table_fields or [query_field]
 
 
 class ColumnMapRow(QFrame):
@@ -416,11 +431,22 @@ class MainWindow(QMainWindow):
         return page
 
     def _sync_page(self) -> QWidget:
-        page, layout = self._page("汇总同步", "读取所有已启用数据源。是否写入本地汇总库由下方开关决定。")
+        page, layout = self._page("汇总同步", "勾选要汇总的数据源，并可指定写入的 Google 表格或本地文件。同步同时会更新查询缓存。")
         card = QFrame()
         card.setObjectName("card")
         form = QFormLayout(card)
-        self.write_aggregate = QCheckBox("读取完成后写入汇总数据库")
+        self.sync_source_list = QListWidget()
+        self.sync_source_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sync_source_list.setMinimumHeight(140)
+        pick_row = QHBoxLayout()
+        select_all = QPushButton("全选")
+        select_none = QPushButton("全不选")
+        select_all.clicked.connect(lambda: self.set_sync_sources_checked(True))
+        select_none.clicked.connect(lambda: self.set_sync_sources_checked(False))
+        pick_row.addWidget(select_all)
+        pick_row.addWidget(select_none)
+        pick_row.addStretch()
+        self.write_aggregate = QCheckBox("同时写入本地汇总数据库")
         self.write_aggregate.setChecked(bool(self.store.get("write_aggregate", True)))
         self.write_aggregate.toggled.connect(lambda checked: self.store.set("write_aggregate", checked))
         self.max_rows = QSpinBox()
@@ -428,12 +454,28 @@ class MainWindow(QMainWindow):
         self.max_rows.setSingleStep(10000)
         self.max_rows.setValue(int(self.store.get("max_rows_per_db", 500000)))
         self.max_rows.valueChanged.connect(lambda value: self.store.set("max_rows_per_db", value))
-        form.addRow("汇总方式", self.write_aggregate)
+        self.sync_google_url = QLineEdit(str(self.store.get("sync_google_url", "") or ""))
+        self.sync_google_url.setPlaceholderText("可选：https://docs.google.com/spreadsheets/d/...")
+        self.sync_google_sheet = QLineEdit(str(self.store.get("sync_google_sheet", "汇总结果") or "汇总结果"))
+        self.sync_local_xlsx = QLineEdit(str(self.store.get("sync_local_xlsx", "") or ""))
+        self.sync_local_xlsx.setPlaceholderText("可选：本地 Excel 路径")
+        choose = QPushButton("选择…")
+        choose.clicked.connect(self.choose_sync_xlsx)
+        xlsx_row = QHBoxLayout()
+        xlsx_row.addWidget(self.sync_local_xlsx, 1)
+        xlsx_row.addWidget(choose)
+        form.addRow("选择数据源", self.sync_source_list)
+        form.addRow("", pick_row)
+        form.addRow("本地汇总库", self.write_aggregate)
         form.addRow("单库最大行数", self.max_rows)
-        hint = QLabel("超过单库上限时会自动生成 aggregate_002、aggregate_003…，查询时自动跨库。")
+        form.addRow("写入 Google 表格", self.sync_google_url)
+        form.addRow("目标工作表", self.sync_google_sheet)
+        form.addRow("写入本地 Excel", xlsx_row)
+        hint = QLabel("至少勾选一个数据源。Google 表格和本地 Excel 都是可选写入目标；不填则只更新缓存/汇总库。")
         hint.setObjectName("muted")
+        hint.setWordWrap(True)
         form.addRow("", hint)
-        self.sync_button = QPushButton("开始读取与同步")
+        self.sync_button = QPushButton("开始同步并更新缓存")
         self.sync_button.setObjectName("primary")
         self.sync_button.clicked.connect(self.run_sync)
         self.sync_status = QTextEdit()
@@ -447,7 +489,7 @@ class MainWindow(QMainWindow):
     def _query_page(self) -> QWidget:
         page, layout = self._page(
             "数据查询",
-            "切换表格来源时，查询字段会换成该表自己的表头；也可以手输列名自定义查询。",
+            "结果按当前表自己的表头显示。只有号码数据表才复制号码和修正格式；查询默认走本地缓存。",
         )
         bar = QHBoxLayout()
         self.query_field = QComboBox()
@@ -458,7 +500,7 @@ class MainWindow(QMainWindow):
         self.query_value.setMaximumHeight(78)
         self.query_value.setPlaceholderText("每行一个查询值，也支持逗号分隔批量粘贴")
         self.query_mode = QComboBox()
-        self.query_mode.addItems(["查询提取表", "查询汇总数据库", "直接查询数据源"])
+        self.query_mode.addItems(["查询提取表", "查询汇总数据库", "查询数据源"])
         saved_source = str(self.store.get("query_source", "extract"))
         if saved_source in QUERY_SOURCES:
             self.query_mode.setCurrentIndex(QUERY_SOURCES.index(saved_source))
@@ -496,7 +538,12 @@ class MainWindow(QMainWindow):
         button = QPushButton("查询")
         button.setObjectName("primary")
         button.clicked.connect(self.run_query)
-        self.copy_query_button = QPushButton("一键复制号码和修正格式")
+        self.query_refresh_cache = QCheckBox("查询前刷新缓存")
+        self.query_refresh_cache.setChecked(bool(self.store.get("query_refresh_cache", False)))
+        self.query_refresh_cache.toggled.connect(self.persist_workspace_settings)
+        self.refresh_cache_button = QPushButton("刷新缓存")
+        self.refresh_cache_button.clicked.connect(self.run_refresh_cache)
+        self.copy_query_button = QPushButton("一键复制结果")
         self.copy_query_button.setEnabled(False)
         self.copy_query_button.clicked.connect(self.copy_query_results)
         bar.addWidget(QLabel("表格来源"))
@@ -507,6 +554,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
         bar.addWidget(self.query_fuzzy)
+        bar.addWidget(self.query_refresh_cache)
+        bar.addWidget(self.refresh_cache_button)
         bar.addWidget(button)
         bar.addWidget(self.copy_query_button)
         date_bar = QHBoxLayout()
@@ -523,15 +572,18 @@ class MainWindow(QMainWindow):
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.query_table.verticalHeader().setVisible(False)
         self.query_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        hint = QLabel("提取表、汇总库、每个数据源都可以用各自表头查询。查数据源时先选数据表，查询字段会跟着切换；也可以直接输入列名。")
+        hint = QLabel("其他表即使查询号码字段，也按该表表头显示。只有号码数据表才显示修正格式，并提供“复制号码和修正格式”。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         self.query_result_summary = QLabel("查询结果：0 条")
         self.query_result_summary.setObjectName("muted")
         self.query_result_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.query_cache_status = QLabel("缓存：尚未读取")
+        self.query_cache_status.setObjectName("muted")
         layout.addLayout(bar)
         layout.addLayout(date_bar)
         layout.addWidget(hint)
+        layout.addWidget(self.query_cache_status)
         layout.addWidget(self.query_result_summary)
         layout.addWidget(self.query_table, 1)
         self.update_query_date_controls()
@@ -773,6 +825,7 @@ class MainWindow(QMainWindow):
                 self.source_table.setItem(row, column, QTableWidgetItem(value))
         self.refresh_query_source_picker()
         self.refresh_extract_source_picker()
+        self.refresh_sync_source_list()
         if not getattr(self, "_restoring_settings", False):
             self.refresh_query_fields()
 
@@ -814,23 +867,73 @@ class MainWindow(QMainWindow):
     def scan_finished(self, names: list[str]) -> None:
         QMessageBox.information(self, "Sheet 列表", "\n".join(names) if names else "没有发现子 Sheet。")
 
+    def refresh_sync_source_list(self) -> None:
+        if not hasattr(self, "sync_source_list"):
+            return
+        saved = {str(item) for item in (self.store.get("sync_source_ids", []) or [])}
+        self.sync_source_list.clear()
+        for source in self.store.load_sources():
+            if not source.enabled:
+                continue
+            item = QListWidgetItem(source.name)
+            item.setData(Qt.UserRole, source.id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if (not saved or source.id in saved) else Qt.Unchecked)
+            self.sync_source_list.addItem(item)
+
+    def set_sync_sources_checked(self, checked: bool) -> None:
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.sync_source_list.count()):
+            self.sync_source_list.item(row).setCheckState(state)
+
+    def selected_sync_source_ids(self) -> list[str]:
+        if not hasattr(self, "sync_source_list"):
+            return []
+        return [
+            str(self.sync_source_list.item(row).data(Qt.UserRole))
+            for row in range(self.sync_source_list.count())
+            if self.sync_source_list.item(row).checkState() == Qt.Checked
+        ]
+
+    def choose_sync_xlsx(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "保存汇总结果", self.sync_local_xlsx.text(), "Excel 工作簿 (*.xlsx)")
+        if path:
+            if not path.lower().endswith(".xlsx"):
+                path += ".xlsx"
+            self.sync_local_xlsx.setText(path)
+
     def run_sync(self) -> None:
+        ids = self.selected_sync_source_ids()
+        if not ids:
+            QMessageBox.warning(self, "请选择", "请至少勾选一个要汇总的数据源。")
+            return
+        self.persist_workspace_settings()
         self.sync_status.clear()
         self.sync_button.setEnabled(False)
         engine = DataEngine(self.store)
-        self.run_task(engine.sync, self.sync_finished, "正在读取与同步…", self.sync_button)
+        self.run_task(
+            lambda: engine.sync(
+                ids,
+                self.write_aggregate.isChecked(),
+                self.sync_google_url.text().strip(),
+                self.sync_google_sheet.text().strip() or "汇总结果",
+                self.sync_local_xlsx.text().strip(),
+            ),
+            self.sync_finished,
+            "正在同步并更新缓存…",
+            self.sync_button,
+        )
 
     def sync_finished(self, result: dict[str, int]) -> None:
         self.refresh_logs()
         recent = list(reversed(self.store.read_logs(100)))
         self.sync_status.setPlainText("\n".join(
             f"[{row['created_at']}] {row['level']} · {row['message']}" for row in recent
-            if row["operation"] in {"汇总同步", "读取数据源"}
+            if row["operation"] in {"汇总同步", "读取数据源", "刷新缓存"}
         ))
-        if result["databases"]:
-            QMessageBox.information(self, "同步完成", f"已写入 {result['rows']} 行，使用 {result['databases']} 个数据库文件。")
-        else:
-            QMessageBox.information(self, "读取完成", f"已读取 {result['rows']} 行；未写入汇总库。")
+        self.update_query_cache_status()
+        sources = result.get("sources", 0)
+        QMessageBox.information(self, "同步完成", f"已处理 {sources} 个数据源，共 {result.get('rows', 0)} 行，查询缓存已更新。")
 
     def persist_workspace_settings(self) -> None:
         if getattr(self, "_restoring_settings", False):
@@ -850,6 +953,8 @@ class MainWindow(QMainWindow):
                 self.store.set("query_fields_by_mode", saved_map)
             if hasattr(self, "query_source_pick"):
                 self.store.set("query_direct_source_id", self.query_source_pick.currentData() or "")
+            if hasattr(self, "query_refresh_cache"):
+                self.store.set("query_refresh_cache", self.query_refresh_cache.isChecked())
         if hasattr(self, "output_type"):
             self.store.set("extract_destination_type", "google" if self.output_type.currentIndex() == 1 else "local")
             self.store.set("google_output_url", self.google_output_url.text().strip())
@@ -870,6 +975,11 @@ class MainWindow(QMainWindow):
             if hasattr(self, "extract_schema_enabled"):
                 self.store.set("extract_column_schema_enabled", self.extract_schema_enabled.isChecked())
                 self.store.set("extract_column_schema", self.extract_schema_editor.schema())
+        if hasattr(self, "sync_google_url"):
+            self.store.set("sync_google_url", self.sync_google_url.text().strip())
+            self.store.set("sync_google_sheet", self.sync_google_sheet.text().strip() or "汇总结果")
+            self.store.set("sync_local_xlsx", self.sync_local_xlsx.text().strip())
+            self.store.set("sync_source_ids", self.selected_sync_source_ids())
 
     def closeEvent(self, event) -> None:
         self.persist_workspace_settings()
@@ -894,6 +1004,49 @@ class MainWindow(QMainWindow):
         if self.current_query_mode() != "direct" or not hasattr(self, "query_source_pick"):
             return ""
         return str(self.query_source_pick.currentData() or "")
+
+    def current_query_source_name(self) -> str:
+        if self.current_query_mode() != "direct" or not hasattr(self, "query_source_pick"):
+            return ""
+        if not self.query_source_pick.currentData():
+            return ""
+        return self.query_source_pick.currentText().strip()
+
+    def current_table_is_phone(self, fields: list[str] | None = None) -> bool:
+        return is_phone_data_table(fields if fields is not None else self._current_result_fields(), self.current_query_source_name())
+
+    def _current_result_fields(self) -> list[str]:
+        extract_target, extract_sheet = self.extract_query_target()
+        return DataEngine(self.store).list_query_fields(
+            self.current_query_mode(), extract_target, extract_sheet, self.current_query_source_id(),
+        )
+
+    def update_copy_button(self) -> None:
+        if not hasattr(self, "copy_query_button"):
+            return
+        if self.current_table_is_phone():
+            self.copy_query_button.setText("一键复制号码和修正格式")
+        else:
+            self.copy_query_button.setText("一键复制结果")
+
+    def update_query_cache_status(self) -> None:
+        if not hasattr(self, "query_cache_status"):
+            return
+        engine = DataEngine(self.store)
+        mode = self.current_query_mode()
+        if mode == "aggregate":
+            self.query_cache_status.setText("缓存：汇总库为本地数据，查询较快")
+            return
+        cache_id = "extract-table" if mode == "extract" else self.current_query_source_id()
+        if mode == "direct" and not cache_id:
+            self.query_cache_status.setText("缓存：查询时使用各数据源本地缓存；无缓存会自动拉取")
+            return
+        if cache_id and engine.cache.has(cache_id):
+            self.query_cache_status.setText(
+                f"缓存：{engine.cache.row_count(cache_id)} 行，更新于 {engine.cache.updated_at(cache_id)}"
+            )
+        else:
+            self.query_cache_status.setText("缓存：尚未建立。点「刷新缓存」或查询时会自动拉取。")
 
     def on_query_mode_changed(self) -> None:
         if getattr(self, "_restoring_settings", False):
@@ -1014,6 +1167,8 @@ class MainWindow(QMainWindow):
         if date_pick:
             self.query_date_field.setCurrentText(date_pick)
         self._restoring_settings = restoring
+        self.update_copy_button()
+        self.update_query_cache_status()
 
     def run_query(self) -> None:
         values = split_names(self.query_value.toPlainText())
@@ -1041,17 +1196,40 @@ class MainWindow(QMainWindow):
             source,
             field,
             engine.list_query_fields(source, extract_target, extract_sheet, source_id),
+            self.current_query_source_name(),
         )
         if hasattr(self, "query_result_summary"):
             self.query_result_summary.setText(f"正在查询：输入 {len(values)} 个值…")
+        refresh = bool(getattr(self, "query_refresh_cache", None) and self.query_refresh_cache.isChecked())
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
-                date_field, start_date, end_date,
+                date_field, start_date, end_date, refresh,
             ),
             lambda results: self.show_query_results(results, result_fields, field),
-            "正在批量查询…",
+            "正在刷新缓存并查询…" if refresh else "正在查询缓存…",
         )
+
+    def run_refresh_cache(self) -> None:
+        self.persist_workspace_settings()
+        engine = DataEngine(self.store)
+        mode = self.current_query_mode()
+        if mode == "extract":
+            job = lambda: engine.refresh_cache([], include_extract=True)
+        elif mode == "direct":
+            source_id = self.current_query_source_id()
+            ids = [source_id] if source_id else [source.id for source in self.store.load_sources() if source.enabled]
+            job = lambda: engine.refresh_cache(ids)
+        else:
+            QMessageBox.information(self, "无需刷新", "汇总库本身就是本地数据，直接查询即可。")
+            return
+        self.run_task(job, self.refresh_cache_finished, "正在刷新缓存…", self.refresh_cache_button)
+
+    def refresh_cache_finished(self, result: dict[str, int]) -> None:
+        self.update_query_cache_status()
+        self.refresh_query_fields()
+        self.refresh_logs()
+        QMessageBox.information(self, "缓存已更新", f"已缓存 {result.get('rows', 0)} 行。")
 
     @staticmethod
     def corrected_source(source: str) -> str:
@@ -1072,47 +1250,43 @@ class MainWindow(QMainWindow):
         query_field: str = "号码",
     ) -> None:
         if not fields:
-            engine = DataEngine(self.store)
-            if engine._field_kind(query_field).casefold() == "号码":
-                fields = DEFAULT_QUERY_RESULT_FIELDS.copy()
-            else:
-                fields = [query_field]
-        self.query_table.setColumnCount(len(fields))
-        self.query_table.setHorizontalHeaderLabels(fields)
+            fields = self._current_result_fields() or [query_field]
+        phone_table = self.current_table_is_phone(fields)
+        display_fields = DEFAULT_QUERY_RESULT_FIELDS.copy() if phone_table else list(fields)
+        self.query_table.setColumnCount(len(display_fields))
+        self.query_table.setHorizontalHeaderLabels(display_fields)
         self.query_table.setRowCount(len(results))
-        self.query_copy_rows: list[tuple[str, str]] = []
+        self.query_copy_rows: list[list[str]] = [display_fields]
         engine = DataEngine(self.store)
         query_canonical = engine._canonical_field(query_field).casefold()
         found = 0
         for row, (query_value, record) in enumerate(results):
             if record is None:
-                values = ["" for _ in fields]
-                for column, header_name in enumerate(fields):
+                values = ["" for _ in display_fields]
+                for column, header_name in enumerate(display_fields):
                     if header_name.strip() in {"输入电话号码", "输入电话", "查询值"}:
                         values[column] = query_value
                     elif engine._canonical_field(header_name).casefold() == query_canonical:
                         values[column] = query_value
                         break
-                phone = query_value if query_canonical == "号码" else ""
-                corrected = "未找到"
             else:
                 found += 1
                 values = [
                     query_value if header_name.strip() in {"输入电话号码", "输入电话", "查询值"}
                     else engine.query_display_value(record, header_name)
-                    for header_name in fields
+                    for header_name in display_fields
                 ]
-                phone = engine._field_value(record, "号码") or (query_value if query_canonical == "号码" else "")
-                corrected = self.corrected_source(record.sheet_name)
-            self.query_copy_rows.append((str(phone), str(corrected)))
+            self.query_copy_rows.append([str(item) for item in values])
             for column, value in enumerate(values):
                 self.query_table.setItem(row, column, QTableWidgetItem(str(value)))
         header = self.query_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        for column, header_name in enumerate(fields):
+        for column, header_name in enumerate(display_fields):
             if header_name.strip().casefold() in {"评论贴文", "链接", "网址", "url", "link"}:
                 header.setSectionResizeMode(column, QHeaderView.Stretch)
-        self.copy_query_button.setEnabled(bool(self.query_copy_rows))
+        self.copy_query_button.setEnabled(len(results) > 0)
+        self.update_copy_button()
+        self.update_query_cache_status()
         missing = len(results) - found
         input_count = len({str(query_value) for query_value, _ in results})
         summary = f"查询结果：共 {len(results)} 条；匹配 {found} 条；未找到 {missing} 条；输入 {input_count} 个值"
@@ -1127,10 +1301,27 @@ class MainWindow(QMainWindow):
     def copy_query_results(self) -> None:
         rows = getattr(self, "query_copy_rows", [])
         if not rows:
-            QMessageBox.information(self, "没有结果", "请先查询号码。")
+            QMessageBox.information(self, "没有结果", "请先查询。")
             return
-        QApplication.clipboard().setText("\n".join(f"{phone}\t{corrected}" for phone, corrected in rows))
-        self.statusBar().showMessage(f"已复制 {len(rows)} 行：号码和修正格式", 5000)
+        headers = rows[0] if rows and isinstance(rows[0], list) else []
+        body = rows[1:] if headers else rows
+        if headers and "修正格式" in headers:
+            phone_index = next(
+                (index for index, name in enumerate(headers) if str(name).strip().casefold() in {item.casefold() for item in PHONE_HEADERS}),
+                0,
+            )
+            extra_index = headers.index("修正格式")
+            lines = []
+            for row in body:
+                phone = row[phone_index] if phone_index < len(row) else ""
+                extra = row[extra_index] if extra_index < len(row) else ""
+                lines.append(f"{phone}\t{extra}".rstrip())
+            QApplication.clipboard().setText("\n".join(lines))
+            self.statusBar().showMessage(f"已复制 {len(body)} 行：号码和修正格式", 5000)
+            return
+        text_rows = rows if headers else [[str(item) for item in row] for row in rows]
+        QApplication.clipboard().setText("\n".join("\t".join(row) for row in text_rows))
+        self.statusBar().showMessage(f"已复制 {max(0, len(body))} 行当前表头结果", 5000)
 
     def choose_output(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "保存提取结果", self.output_path.text(), "Excel 工作簿 (*.xlsx)")

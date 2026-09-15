@@ -109,6 +109,11 @@ class ConfigStore:
             "extract_signature_column": "",
             "extract_column_schema_enabled": False,
             "extract_column_schema": [],
+            "sync_source_ids": [],
+            "sync_google_url": "",
+            "sync_google_sheet": "汇总结果",
+            "sync_local_xlsx": "",
+            "query_refresh_cache": False,
         }
         for key, value in defaults.items():
             if self.get(key, None) is None:
